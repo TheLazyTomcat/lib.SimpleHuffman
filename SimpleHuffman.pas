@@ -32,7 +32,7 @@ type
   TSHBitSequenceData = packed array[0..31] of UInt8;
 
   TSHBitSequence = record
-    Length: Integer;
+    Length: TMemSize;
     Data:   TSHBitSequenceData;
   end;
 
@@ -99,7 +99,7 @@ type
     procedure BuildTree(Frequencies: array of Int64); virtual;
     procedure ConstructTree; virtual;
     procedure ClearTree; virtual;
-    Function IsReadyTree: Boolean; virtual;
+    Function TreeIsReady: Boolean; virtual;
     // set TreeNodeIndex to an invalid (eg. negative) value before first call
     Function TraverseTree(BitPath: Boolean; var TreeNodeIndex: Integer): Boolean; virtual;
     // streaming (saving, loading)
@@ -112,6 +112,7 @@ type
     procedure LoadFromFile(const FileName: String); virtual;
     // other
     Function IsSame(Tree: THuffmanTree): Boolean; virtual;
+    //Function CompressFrequencies(Force: Boolean = False): Boolean; virtual;
     procedure Foo;
     // properties
   {
@@ -138,25 +139,46 @@ type
 type
   THuffmanBase = class(TCustomObject)
   protected
-    fHuffmanTree:       THuffmanTree;
-    fStreamBufferSize:  TMemSize;
-    fUncompressedSize:  Int64;
-    fCompressedSize:    Int64;
-    fCompressionRatio:  Double;
-    fBreakProcessing:   Boolean;
+    fHuffmanTree:           THuffmanTree;
+    fStreamBufferSize:      TMemSize;
+    fUncompressedSize:      Int64;
+    fCompressedSize:        Int64;
+    fCompressionRatio:      Double;
+    fBreakProcessing:       Boolean;
+    fScanInitialized:       Boolean;
+    fScanFinalized:         Boolean;
+    fScanProgressCallback:  TProgressCallback;
+    fScanProgressEvent:     TProgressEvent;
+    procedure DoScanProgress(Progress: Double); virtual;
     procedure Initialize; virtual;
     procedure Finalize; virtual;
   public
     constructor Create;
     destructor Destroy; override;
     Function BreakProcessing: Boolean; virtual;
+    // scanning
+    procedure ScanInit; virtual;
+    procedure ScanUpdate(const Buffer; Size: TMemSize); virtual;
+    Function ScanFinal: Int64; virtual;
+    // scanning macros
+    Function ScanMemory(Memory: Pointer; Size: TMemSize): Int64; virtual;
+    Function ScanBuffer(const Buffer; Size: TMemSize): Int64; virtual;
+    Function ScanAnsiString(const Str: AnsiString): Int64; virtual;
+    Function ScanWideString(const Str: WideString): Int64; virtual;
+    Function ScanString(const Str: String): Int64; virtual;
+    Function ScanStream(Stream: TStream; Count: Int64 = -1): Int64; virtual;
+    Function ScanFile(const FileName: String): Int64; virtual;
+    // properties
     property HuffmanTree: THuffmanTree read fHuffmanTree;
     property StreamBufferSize: TMemSize read fStreamBufferSize write fStreamBufferSize;
     property UncompressedSize: Int64 read fUncompressedSize;
     property CompressedSize: Int64 read fCompressedSize;
     property CompressionRatio: Double read fCompressionRatio;
+    // events
+    property OnScanProgressCallback: TProgressCallback read fScanProgressCallback write fScanProgressCallback;
+    property OnScanProgressEvent: TProgressEvent read fScanProgressEvent write fScanProgressEvent;
+    property OnScanProgress: TProgressEvent read fScanProgressEvent write fScanProgressEvent;
   end;
-
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -169,60 +191,85 @@ type
 type
   THuffmanEncoder = class(THuffmanBase)
   protected
-    fScanInitialized:         Boolean;
-    fScanFinalized:           Boolean;
-    fEncodeInitialized:       Boolean;
-    fEncodeFinalized:         Boolean;
-    fScanProgressCallback:    TFloatCallback;
-    fScanProgressEvent:       TFloatEvent;
-    fEncodeProgressCallback:  TFloatCallback;
-    fEncodeProgressEvent:     TFloatEvent;
-    fProgressCallback:        TFloatCallback;
-    fProgressEvent:           TFloatEvent;
-    procedure DoScanProgress(Progress: Double); virtual;
+    fEncodedSizeInitialized:      Boolean;
+    fEncodedSizeFinalized:        Boolean;
+    fEncodedSizeCounters:         array[UInt8] of Int64;
+    fEncodeInitialized:           Boolean;
+    fEncodeFinalized:             Boolean;
+    fEncodingBuffer:              Pointer;
+    fEncodingTransferBits:        TMemSize;
+    fEncodedSizeProgressCallback: TProgressCallback;
+    fEncodedSizeProgressEvent:    TProgressEvent;
+    fEncodeProgressCallback:      TProgressCallback;
+    fEncodeProgressEvent:         TProgressEvent;
+    procedure DoEncodedSizeProgress(Progress: Double); virtual;
     procedure DoEncodeProgress(Progress: Double); virtual;
     procedure Initialize; override;
+    procedure Finalize; override;
   public
-    // scanning
-    procedure ScanInit; virtual;
-    procedure ScanUpdate(const Buffer; Size: TMemSize); virtual;
-    Function ScanFinal(const Buffer; Size: TMemSize): Int64; overload; virtual;
-    Function ScanFinal: Int64; overload; virtual;
-    // scanning macros
-    Function ScanMemory(Memory: Pointer; Size: TMemSize): Int64; virtual;
-    Function ScanBuffer(const Buffer; Size: TMemSize): Int64; virtual;
-    Function ScanAnsiString(const Str: AnsiString): Int64; virtual;
-    Function ScanWideString(const Str: WideString): Int64; virtual;
-    Function ScanString(const Str: String): Int64; virtual;
-    Function ScanStream(Stream: TStream; Count: Int64 = -1): Int64; virtual;
-    Function ScanFile(const FileName: String): Int64; virtual;
+    // encoded size
+    procedure EncodedSizeInit; virtual;
+    procedure EncodedSizeUpdate(const Buffer; Size: TMemSize); virtual;
+    Function EncodedSizeFinal: Int64; virtual;
+    // encoded size macros
+    Function EncodedSizeMemory(Memory: Pointer; Size: TMemSize): Int64; virtual;
+    Function EncodedSizeBuffer(const Buffer; Size: TMemSize): Int64; virtual;
+    Function EncodedSizeAnsiString(const Str: AnsiString): Int64; virtual;
+    Function EncodedSizeWideString(const Str: WideString): Int64; virtual;
+    Function EncodedSizeString(const Str: String): Int64; virtual;
+    Function EncodedSizeStream(Stream: TStream; Count: Int64 = -1): Int64; virtual;
+    Function EncodedSizeFile(const FileName: String): Int64; virtual;
     // encoding
-    procedure EncodeInit; virtual;
-    procedure EncodeUpdate(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize); virtual;
-    procedure EncodeFinal(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize); overload; virtual;
-    procedure EncodeFinal(out BufferOut; var SizeOut: TMemSize); overload; virtual;
-    // encoding macros
-    //procedure EncodeMemory(MemoryIn: Pointer; SizeIn: TMemSize; MemoryOut: Pointer; SizeOut: TMemSize); virtual;
-    //procedure EncodeBuffer(const BufferIn; SizeIn: TMemSize; out MemoryOut; SizeOut: TMemSize); virtual;
-    //procedure EncodeAnsiString(const StrIn: AnsiString; out StrOut: AnsiString); virtual;
-    //procedure EncodeWideString(const StrIn: WideString; out StrOut: WideString); virtual;
-    //procedure EncodeString(const StrIn: String; out StrOut: String); virtual;
-    //procedure EncodeStream(StreamIn: TStream; Count: Int64 = -1; StreamOut: Stream); virtual;
-    //procedure EncodeFile(const FileNameIn,FileNameOut: String); virtual;
-    // properties
-    property OnScanProgressCallback: TFloatCallback read fScanProgressCallback write fScanProgressCallback;
-    property OnScanProgressEvent: TFloatEvent read fScanProgressEvent write fScanProgressEvent;
-    property OnScanProgress: TFloatEvent read fScanProgressEvent write fScanProgressEvent;
-    property OnEncodeProgressCallback: TFloatCallback read fEncodeProgressCallback write fEncodeProgressCallback;
-    property OnEncodeProgressEvent: TFloatEvent read fEncodeProgressEvent write fEncodeProgressEvent;
-    property OnEncodeProgress: TFloatEvent read fEncodeProgressEvent write fEncodeProgressEvent;
   {
-    Following are reporting progress of scanning in interval <0.0,1.0> and progress
-    of encoding in interval <1.0,2.0>.
+    The tree must be prepared before calling EncodeInit.
   }
-    property OnProgressCallback: TFloatCallback read fProgressCallback write fProgressCallback;
-    property OnProgressEvent: TFloatEvent read fProgressEvent write fProgressEvent;
-    property OnProgress: TFloatEvent read fProgressEvent write fProgressEvent;
+    procedure EncodeInit; virtual;
+  {
+    Set SizeIn to size of the BufferIn and SizeOut to size of BufferOut (this
+    buffer must be allocated by the caller).
+
+    Upon return, the SizeIn will contain number of bytes that were consumed
+    from BufferIn within the call, which might be less than was passed. SizeOut
+    will contain number of bytes that were written into BufferOut.
+  }
+    procedure EncodeUpdate(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize); virtual;
+  {
+    Set SizeOut to a size of BufferOut.
+    When the funtion succeeds (returns true), then the SizeOut will contain
+    number of bytes written into the BufferOut.
+    When the function fails (returns false) due to output buffer being too
+    small, the SizeOut will be set to a minimum size the output buffer needs
+    to be (reallocate it as such and call this function again).
+  }
+    Function EncodeFinal(out BufferOut; var SizeOut: TMemSize): Boolean; virtual;
+    // encoding macros
+  {
+    WARNING - MemoryOut/BufferOut output buffers must be allocated by the
+              caller and SizeOut must contain their allocated size. StrOut
+              string variable parameters must also be allocated (string length
+              set).
+              You can get the required size, in bytes, when scanning the data,
+              or, if using pre-computed huffman tree, use EncodedSize* methods
+              (tree must be prepared/loaded before calling any EncodedSize*
+              method) - note that using EncodedSize* is "fast", in the sense
+              there is almost no processing done, so the performance depends
+              only on how fast can the data be served.
+  }
+    procedure EncodeMemory(MemoryIn: Pointer; SizeIn: TMemSize; MemoryOut: Pointer; SizeOut: TMemSize); virtual;
+    procedure EncodeBuffer(const BufferIn; SizeIn: TMemSize; out BufferOut; SizeOut: TMemSize); virtual;
+    procedure EncodeAnsiString(const StrIn: AnsiString; var StrOut: AnsiString); virtual;
+    procedure EncodeWideString(const StrIn: WideString; var StrOut: WideString); virtual;
+    procedure EncodeString(const StrIn: String; var StrOut: String); virtual;
+    procedure EncodeStream(StreamIn: TStream; Count: Int64; StreamOut: TStream); overload; virtual;
+    procedure EncodeStream(StreamIn: TStream; StreamOut: TStream); overload; virtual;
+    procedure EncodeFile(const FileNameIn,FileNameOut: String); virtual;
+    // properties
+    property OnEncodedSizeProgressCallback: TProgressCallback read fEncodedSizeProgressCallback write fEncodedSizeProgressCallback;
+    property OnEncodedSizeProgressEvent: TProgressEvent read fEncodedSizeProgressEvent write fEncodedSizeProgressEvent;
+    property OnEncodedSizeProgress: TProgressEvent read fEncodedSizeProgressEvent write fEncodedSizeProgressEvent;
+    property OnEncodeProgressCallback: TProgressCallback read fEncodeProgressCallback write fEncodeProgressCallback;
+    property OnEncodeProgressEvent: TProgressEvent read fEncodeProgressEvent write fEncodeProgressEvent;
+    property OnEncodeProgress: TProgressEvent read fEncodeProgressEvent write fEncodeProgressEvent;
   end;
 
 {===============================================================================
@@ -237,6 +284,7 @@ type
   THuffmanDecoder = class(THuffmanBase)
   protected
   public
+    // also include DecodedSize* (slow, but to be complete)
   end;
 
 implementation
@@ -792,7 +840,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanTree.IsReadyTree: Boolean;
+Function THuffmanTree.TreeIsReady: Boolean;
 begin
 Result := Assigned(fRootTreeNode);
 end;
@@ -1038,16 +1086,16 @@ Ctr := 0;
 If Assigned(fRootTreeNode) then
   begin
     Traverse(fRootTreeNode,'');
-    WriteLn('node count       ',Ctr);
-    WriteLn('root frequency   ',fRootTreeNode^.Frequency);
+    WriteLn('node count        ',Ctr);
+    WriteLn('root frequency    ',fRootTreeNode^.Frequency);
   end;
 Bits := 0;
 For i := LowByteNodeIndex to HighByteNodeIndex do
   Bits := Bits + (fByteNodes[UInt8(i)].Frequency * fByteNodes[UInt8(i)].BitSequence.Length);
-WriteLn('bits             ',Bits);
-WriteLn('bytes            ',(Bits + 7) shr 3);
+WriteLn('bits              ',Bits);
+WriteLn('bytes             ',(Bits + 7) shr 3);
 If fRootTreeNode^.Frequency <> 0 then
-  WriteLn('compression rate ',Format('%.2f%%',[(((Bits + 7) shr 3) / fRootTreeNode^.Frequency) * 100]));
+  WriteLn('compression ratio ',Format('%.2f%%',[(((Bits + 7) shr 3) / fRootTreeNode^.Frequency) * 100]));
 end;
 
 
@@ -1064,6 +1112,16 @@ end;
     THuffmanBase - protected methods
 -------------------------------------------------------------------------------}
 
+procedure THuffmanBase.DoScanProgress(Progress: Double);
+begin
+If Assigned(fScanProgressEvent) then
+  fScanProgressEvent(Self,Progress)
+else If Assigned(fScanProgressCallback) then
+  fScanProgressCallback(Self,Progress);
+end;
+
+//------------------------------------------------------------------------------
+
 procedure THuffmanBase.Initialize;
 begin
 fHuffmanTree := THuffmanTree.Create;
@@ -1072,6 +1130,10 @@ fUncompressedSize := 0;
 fCompressedSize := 0;
 fCompressionRatio := 0.0;
 fBreakProcessing := False;
+fScanInitialized := False;
+fScanFinalized := False;
+fScanProgressCallback := nil;
+fScanProgressEvent := nil;
 end;
 
 //------------------------------------------------------------------------------
@@ -1107,67 +1169,9 @@ Result := fBreakProcessing;
 fBreakProcessing := True;
 end;
 
-
-{===============================================================================
---------------------------------------------------------------------------------
-                                 THuffmanEncoder
---------------------------------------------------------------------------------
-===============================================================================}
-{===============================================================================
-    THuffmanEncoder - class declaration
-===============================================================================}
-{-------------------------------------------------------------------------------
-    THuffmanEncoder - protected methods
--------------------------------------------------------------------------------}
-
-procedure THuffmanEncoder.DoScanProgress(Progress: Double);
-begin
-If Assigned(fScanProgressEvent) then
-  fScanProgressEvent(Self,Progress)
-else If Assigned(fScanProgressCallback) then
-  fScanProgressCallback(Self,Progress);
-If Assigned(fProgressEvent) then
-  fProgressEvent(Self,Progress)
-else If Assigned(fProgressCallback) then
-  fProgressCallback(Self,Progress);
-end;
-
 //------------------------------------------------------------------------------
 
-procedure THuffmanEncoder.DoEncodeProgress(Progress: Double);
-begin
-If Assigned(fEncodeProgressEvent) then
-  fEncodeProgressEvent(Self,Progress)
-else If Assigned(fEncodeProgressCallback) then
-  fEncodeProgressCallback(Self,Progress);
-If Assigned(fProgressEvent) then
-  fProgressEvent(Self,1.0 + Progress)
-else If Assigned(fProgressCallback) then
-  fProgressCallback(Self,1.0 + Progress);
-end;
-
-{-------------------------------------------------------------------------------
-    THuffmanEncoder - public methods
--------------------------------------------------------------------------------}
-
-procedure THuffmanEncoder.Initialize;
-begin
-inherited;
-fScanInitialized := False;
-fScanFinalized := False;
-fEncodeInitialized := False;
-fEncodeFinalized := False;
-fScanProgressCallback := nil;
-fScanProgressEvent := nil;
-fEncodeProgressCallback := nil;
-fEncodeProgressEvent := nil;
-fProgressCallback := nil;
-fProgressEvent := nil;
-end;
-
-//------------------------------------------------------------------------------
-
-procedure THuffmanEncoder.ScanInit;
+procedure THuffmanBase.ScanInit;
 begin
 fHuffmanTree.ClearTree;
 fScanInitialized := True;
@@ -1176,14 +1180,14 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure THuffmanEncoder.ScanUpdate(const Buffer; Size: TMemSize);
+procedure THuffmanBase.ScanUpdate(const Buffer; Size: TMemSize);
 var
   Buff: PUInt8;
   i:    TMemSize;
 begin
-If fScanFinalized then
+If not fScanFinalized then
   begin
-    If not fScanInitialized then
+    If fScanInitialized then
       begin
         Buff := @Buffer;
         For i := 1 to Size do
@@ -1192,49 +1196,41 @@ If fScanFinalized then
             Inc(Buff);
           end;
       end
-    else raise ESHInvalidState.Create('THuffmanEncoder.ScanUpdate: Scanning not initialized.');
+    else raise ESHInvalidState.Create('THuffmanBase.ScanUpdate: Scanning not initialized.');
   end
-else raise ESHInvalidState.Create('THuffmanEncoder.ScanUpdate: Scanning already finalized.');
+else raise ESHInvalidState.Create('THuffmanBase.ScanUpdate: Scanning already finalized.');
 end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanEncoder.ScanFinal(const Buffer; Size: TMemSize): Int64;
-begin
-ScanUpdate(Buffer,Size);
-Result := ScanFinal;
-end;
-
-// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-
-Function THuffmanEncoder.ScanFinal: Int64;
+Function THuffmanBase.ScanFinal: Int64;
 var
   i:  Integer;
 begin
-If fScanFinalized then
+If not fScanFinalized then
   begin
-    If not fScanInitialized then
+    If fScanInitialized then
       begin
         fHuffmanTree.ConstructTree;
         // get compressed size in bits...
-        Result := 0;
+        Result := 7;
         For i := fHuffmanTree.LowByteNodeIndex to fHuffmanTree.HighByteNodeIndex do
           Inc(Result,(fHuffmanTree[i].Frequency * fHuffmanTree[i].BitSequence.Length));
       {
         ...and convert to bytes - let's hope there is no overflow, 1 EiB (one
         exbibyte, 2^60) should be enough for everyone ;)
       }
-        Result := (Result + 7) shr 3;
+        Result := Result shr 3;
         fScanFinalized := True;
       end
-    else raise ESHInvalidState.Create('THuffmanEncoder.ScanFinal: Scanning not initialized.');
+    else raise ESHInvalidState.Create('THuffmanBase.ScanFinal: Scanning not initialized.');
   end
-else raise ESHInvalidState.Create('THuffmanEncoder.ScanFinal: Scanning already finalized.');
+else raise ESHInvalidState.Create('THuffmanBase.ScanFinal: Scanning already finalized.');
 end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanEncoder.ScanMemory(Memory: Pointer; Size: TMemSize): Int64;
+Function THuffmanBase.ScanMemory(Memory: Pointer; Size: TMemSize): Int64;
 var
   MemoryStream: TStaticMemoryStream;
 begin
@@ -1254,7 +1250,8 @@ else
     If not fBreakProcessing then
       begin
         ScanInit;
-        Result := ScanFinal(Memory^,Size);
+        ScanUpdate(Memory^,Size);
+        Result := ScanFinal;
         DoScanProgress(1.0);
       end
     else Result := 0;
@@ -1263,35 +1260,35 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanEncoder.ScanBuffer(const Buffer; Size: TMemSize): Int64;
+Function THuffmanBase.ScanBuffer(const Buffer; Size: TMemSize): Int64;
 begin
 Result := ScanMemory(@Buffer,Size);
 end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanEncoder.ScanAnsiString(const Str: AnsiString): Int64;
+Function THuffmanBase.ScanAnsiString(const Str: AnsiString): Int64;
 begin
 Result := ScanMemory(PAnsiChar(Str),Length(Str) * SizeOf(AnsiChar));
 end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanEncoder.ScanWideString(const Str: WideString): Int64;
+Function THuffmanBase.ScanWideString(const Str: WideString): Int64;
 begin
 Result := ScanMemory(PWideChar(Str),Length(Str) * SizeOf(WideChar));
 end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanEncoder.ScanString(const Str: String): Int64;
+Function THuffmanBase.ScanString(const Str: String): Int64;
 begin
 Result := ScanMemory(PChar(Str),Length(Str) * SizeOf(Char));
 end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanEncoder.ScanStream(Stream: TStream; Count: Int64 = -1): Int64;
+Function THuffmanBase.ScanStream(Stream: TStream; Count: Int64 = -1): Int64;
 var
   InitCount:  Int64;
   Buffer:     Pointer;
@@ -1331,12 +1328,12 @@ If Assigned(Stream) then
       end
     else Result := 0;      
   end
-else raise ESHInvalidValue.Create('THuffmanEncoder.ScanStream: Stream not assigned.');
+else raise ESHInvalidValue.Create('THuffmanBase.ScanStream: Stream not assigned.');
 end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanEncoder.ScanFile(const FileName: String): Int64;
+Function THuffmanBase.ScanFile(const FileName: String): Int64;
 var
   FileStream: TFileStream;
 begin
@@ -1349,17 +1346,257 @@ finally
 end;
 end;
 
+
+{===============================================================================
+--------------------------------------------------------------------------------
+                                 THuffmanEncoder
+--------------------------------------------------------------------------------
+===============================================================================}
+const
+  SH_ENCODING_BUFFER_SIZE = 4 * 1024; // 4KiB
+  SH_ENCODING_BUFFER_BITS = SH_ENCODING_BUFFER_SIZE * 8;
+
+{===============================================================================
+    THuffmanEncoder - class declaration
+===============================================================================}
+{-------------------------------------------------------------------------------
+    THuffmanEncoder - protected methods
+-------------------------------------------------------------------------------}
+
+procedure THuffmanEncoder.DoEncodedSizeProgress(Progress: Double);
+begin
+If Assigned(fEncodedSizeProgressEvent) then
+  fEncodedSizeProgressEvent(Self,Progress)
+else If Assigned(fEncodedSizeProgressCallback) then
+  fEncodedSizeProgressCallback(Self,Progress);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanEncoder.DoEncodeProgress(Progress: Double);
+begin
+If Assigned(fEncodeProgressEvent) then
+  fEncodeProgressEvent(Self,Progress)
+else If Assigned(fEncodeProgressCallback) then
+  fEncodeProgressCallback(Self,Progress);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanEncoder.Initialize;
+begin
+inherited;
+fEncodedSizeInitialized := False;
+fEncodedSizeFinalized := False;
+FillChar(fEncodedSizeCounters,SizeOf(fEncodedSizeCounters),0);
+fEncodeInitialized := False;
+fEncodeFinalized := False;
+GetMem(fEncodingBuffer,SH_ENCODING_BUFFER_SIZE);
+fEncodingTransferBits := 0;
+fEncodedSizeProgressCallback := nil;
+fEncodedSizeProgressEvent := nil;
+fEncodeProgressCallback := nil;
+fEncodeProgressEvent := nil;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanEncoder.Finalize;
+begin
+FreeMem(fEncodingBuffer,SH_ENCODING_BUFFER_SIZE);
+inherited;
+end;
+
+{-------------------------------------------------------------------------------
+    THuffmanEncoder - public methods
+-------------------------------------------------------------------------------}
+
+procedure THuffmanEncoder.EncodedSizeInit;
+begin
+If fHuffmanTree.TreeIsReady then
+  begin
+    fEncodedSizeInitialized := True;
+    fEncodedSizeFinalized := False;
+    FillChar(fEncodedSizeCounters,SizeOf(fEncodedSizeCounters),0);
+  end
+else raise ESHInvalidState.Create('THuffmanEncoder.EncodedSizeInit: Tree not ready.');
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanEncoder.EncodedSizeUpdate(const Buffer; Size: TMemSize);
+var
+  Buff: PUInt8;
+  i:    TMemSize;
+begin
+If not fEncodedSizeFinalized then
+  begin
+    If fEncodedSizeInitialized then
+      begin
+        Buff := @Buffer;
+        For i := 1 to Size do
+          begin
+            Inc(fEncodedSizeCounters[Buff^]);
+            Inc(Buff);
+          end;
+      end
+    else raise ESHInvalidState.Create('THuffmanEncoder.EncodedSizeUpdate: Encoded size obtaining not initialized.');
+  end
+else raise ESHInvalidState.Create('THuffmanEncoder.EncodedSizeUpdate: Encoded size obtaining already finalized.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanEncoder.EncodedSizeFinal: Int64;
+var
+  i:  Integer;
+begin
+If not fEncodedSizeFinalized then
+  begin
+    If fEncodedSizeInitialized then
+      begin
+        Result := 7;
+        For i := Low(fEncodedSizeCounters) to High(fEncodedSizeCounters) do
+          Inc(Result,fEncodedSizeCounters[i] * fHuffmanTree[i].BitSequence.Length);
+        // convert bits to bytes
+        Result := Result shr 3;          
+      end
+    else raise ESHInvalidState.Create('THuffmanEncoder.EncodedSizeFinal: Encoded size obtaining not initialized.');
+  end
+else raise ESHInvalidState.Create('THuffmanEncoder.EncodedSizeFinal: Encoded size obtaining already finalized.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanEncoder.EncodedSizeMemory(Memory: Pointer; Size: TMemSize): Int64;
+var
+  MemoryStream: TStaticMemoryStream;
+begin
+If Size > fStreamBufferSize then
+  begin
+    MemoryStream := TStaticMemoryStream.Create(Memory,Size);
+    try
+      Result := EncodedSizeStream(MemoryStream);
+    finally
+      MemoryStream.Free;
+    end;
+  end
+else
+  begin
+    fBreakProcessing := False;
+    DoEncodedSizeProgress(0.0);
+    If not fBreakProcessing then
+      begin
+        EncodedSizeInit;
+        EncodedSizeUpdate(Memory^,Size);
+        Result := EncodedSizeFinal;
+        DoEncodedSizeProgress(1.0);
+      end
+    else Result := 0;
+  end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanEncoder.EncodedSizeBuffer(const Buffer; Size: TMemSize): Int64;
+begin
+Result := EncodedSizeMemory(@Buffer,Size);
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanEncoder.EncodedSizeAnsiString(const Str: AnsiString): Int64;
+begin
+Result := EncodedSizeMemory(PAnsiChar(Str),Length(Str) * SizeOf(AnsiChar));
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanEncoder.EncodedSizeWideString(const Str: WideString): Int64;
+begin
+Result := EncodedSizeMemory(PWideChar(Str),Length(Str) * SizeOf(WideChar));
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanEncoder.EncodedSizeString(const Str: String): Int64;
+begin
+Result := EncodedSizeMemory(PChar(Str),Length(Str) * SizeOf(Char));
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanEncoder.EncodedSizeStream(Stream: TStream; Count: Int64 = -1): Int64;
+var
+  InitCount:  Int64;
+  Buffer:     Pointer;
+  BytesRead:  Integer;
+begin
+If Assigned(Stream) then
+  begin
+    If Count = 0 then
+      Count := Stream.Size - Stream.Position;
+    If Count < 0 then
+      begin
+        Stream.Seek(0,soBeginning);
+        Count := Stream.Size;
+      end;
+    InitCount := Count;
+    fBreakProcessing := False;
+    DoEncodedSizeProgress(0.0);
+    If not fBreakProcessing  then
+      begin
+        EncodedSizeInit;
+        If InitCount > 0 then
+          begin
+            GetMem(Buffer,fStreamBufferSize);
+            try
+              repeat
+                BytesRead := Stream.Read(Buffer^,Min(fStreamBufferSize,Count));
+                EncodedSizeUpdate(Buffer^,TMemSize(BytesRead));
+                Dec(Count,BytesRead);
+                DoEncodedSizeProgress((InitCount - Count) / InitCount);
+              until (TMemSize(BytesRead) < fStreamBufferSize) or fBreakProcessing;
+            finally
+              FreeMem(Buffer,fStreamBufferSize);
+            end;
+          end;
+        Result := EncodedSizeFinal;
+        DoEncodedSizeProgress(1.0);
+      end
+    else Result := 0;      
+  end
+else raise ESHInvalidValue.Create('THuffmanEncoder.EncodedSizeStream: Stream not assigned.');
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanEncoder.EncodedSizeFile(const FileName: String): Int64;
+var
+  FileStream: TFileStream;
+begin
+FileStream := TFileStream.Create(StrToRTL(FileName),fmOpenRead or fmShareDenyWrite);
+try
+  FileStream.Seek(0,soBeginning);
+  Result := EncodedSizeStream(FileStream);
+finally
+  FileStream.Free;
+end;
+end;
+
 //------------------------------------------------------------------------------
 
 procedure THuffmanEncoder.EncodeInit;
 begin
-If fHuffmanTree.IsReadyTree then
+If fHuffmanTree.TreeIsReady then
   begin
     fUncompressedSize := 0;
     fCompressedSize := 0;
     fCompressionRatio := 0.0;
     fEncodeInitialized := True;
     fEncodeFinalized := False;
+    FillChar(fEncodingBuffer^,SH_ENCODING_BUFFER_SIZE,0);
+    fEncodingTransferBits := 0;
   end
 else raise ESHInvalidState.Create('THuffmanEncoder.EncodeInit: Tree not ready.');
 end;
@@ -1367,12 +1604,80 @@ end;
 //------------------------------------------------------------------------------
 
 procedure THuffmanEncoder.EncodeUpdate(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize);
-begin
-If fEncodeFinalized then
-  begin
-    If not fEncodeInitialized then
-      begin
+var
+  BuffIn:   PUInt8;
+  BuffOut:  PUInt8;
+  BytesIn:  TMemSize;
+  BytesOut: TMemSize;
 
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+
+  Function ConsumeBytes: Boolean;
+  var
+    TempPtr:      Pointer;
+    BitSequence:  TSHBitSequence;
+  begin
+    Result := False;
+    TempPtr := PtrAdvance(fEncodingBuffer,fEncodingTransferBits shr 3);
+    while BytesIn > 0 do
+      begin
+        BitSequence := fHuffmanTree.BitSequences[BuffIn^];
+        If (fEncodingTransferBits + TMemSize(BitSequence.Length)) <= SH_ENCODING_BUFFER_BITS then
+          begin
+            PutBitsAndMoveDest(PUInt8(TempPtr),fEncodingTransferBits and 7,PUInt8(@BitSequence.Data),BitSequence.Length);
+            Inc(BuffIn);
+            Dec(BytesIn);
+            Inc(fEncodingTransferBits,BitSequence.Length);
+            Inc(fUncompressedSize);
+            Result := True;
+          end
+        else Break{while...};
+      end;
+  end;
+
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+
+  Function ProduceBytes: Boolean;
+  var
+    BytesToMove:  TMemSize;
+  begin
+    If (BytesOut > 0) and (fEncodingTransferBits >= 8) then
+      begin
+        BytesToMove := TMemSize(Min(BytesOut,fEncodingTransferBits shr 3));
+        Move(fEncodingBuffer^,BuffOut^,BytesToMove);
+        Inc(BuffOut,BytesToMove);
+        Dec(BytesOut,BytesToMove);
+        BufferShiftDown(fEncodingBuffer^,(fEncodingTransferBits + 7) shr 3,BytesToMove);
+        Dec(fEncodingTransferBits,BytesToMove * 8);
+        Inc(fCompressedSize,BytesToMove);
+        Result := True;
+      end
+    else Result := False;
+  end;
+
+//--  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --
+
+var
+  BytesConsumed:  Boolean;
+  BytesProduced:  Boolean;
+begin
+If not fEncodeFinalized then
+  begin
+    If fEncodeInitialized then
+      begin
+        BuffIn := @BufferIn;
+        BuffOut := @BufferOut;
+        BytesIn := SizeIn;
+        BytesOut := SizeOut;
+        BytesConsumed := True;
+        BytesProduced := True;
+        while BytesConsumed or BytesProduced do
+          begin
+            BytesConsumed := ConsumeBytes;
+            BytesProduced := ProduceBytes;
+          end;
+        SizeIn := SizeIn - BytesIn;
+        SizeOut := SizeOut - BytesOut;
       end
     else raise ESHInvalidState.Create('THuffmanEncoder.EncodeUpdate: Encoding not initialized.');
   end
@@ -1381,30 +1686,236 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure THuffmanEncoder.EncodeFinal(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize);
+Function THuffmanEncoder.EncodeFinal(out BufferOut; var SizeOut: TMemSize): Boolean;
+var
+  BuffOut:  PUInt8;
 begin
-//EncodeUpdate(BufferIn,SizeIn,BufferOut,SizeOut);
-// check out before proceeding
+If not fEncodeFinalized then
+  begin
+    If fEncodeInitialized then
+      begin
+        If SizeOut >= ((fEncodingTransferBits + 7) shr 3) then
+          begin
+            // buffered data can fit into output
+            BuffOut := @BufferOut;
+            // move whole bytes
+            SizeOut := fEncodingTransferBits shr 3;
+            If SizeOut > 0 then
+              begin
+                Move(fEncodingBuffer^,BuffOut^,SizeOut);
+                Inc(BuffOut,SizeOut);
+              end;
+            // now the partial byte (mask only valid bits)
+            If fEncodingTransferBits and 7 <> 0 then
+              begin
+                BuffOut^ := PUInt8(PtrAdvance(fEncodingBuffer,PtrInt(SizeOut)))^ and
+                            (UInt8($FF) shr (8 - (fEncodingTransferBits and 7)));
+                Inc(SizeOut);
+              end;
+            // final touches
+            Inc(fCompressedSize,SizeOut);
+            If fUncompressedSize <> 0 then
+              fCompressionRatio := fCompressedSize / fUncompressedSize
+            else
+              fCompressionRatio := 0.0;
+            fEncodeFinalized := True;
+            Result := True;
+          end
+        else
+          begin
+            // buffered data cannot fit into output
+            SizeOut := (fEncodingTransferBits + 7) shr 3;
+            Result := False;
+          end;
+      end
+    else raise ESHInvalidState.Create('THuffmanEncoder.EncodeFinal: Encoding not initialized.');
+  end
+else raise ESHInvalidState.Create('THuffmanEncoder.EncodeFinal: Encoding already finalized.');
 end;
 
 //------------------------------------------------------------------------------
 
-procedure THuffmanEncoder.EncodeFinal(out BufferOut; var SizeOut: TMemSize);
+procedure THuffmanEncoder.EncodeMemory(MemoryIn: Pointer; SizeIn: TMemSize; MemoryOut: Pointer; SizeOut: TMemSize);
+var
+  MemoryStreamIn:   TStaticMemoryStream;
+  MemoryStreamOut:  TWritableStaticMemoryStream;
+  SizeInTemp:       TMemSize;
+  SizeOutTemp:      TMemSize;
 begin
-If fEncodeFinalized then
+If SizeIn > fStreamBufferSize then
   begin
-    If not fEncodeInitialized then
-      begin
-        
-        fEncodeFinalized := True;
-      end
-    else raise ESHInvalidState.Create('THuffmanEncoder.EncodeUpdate: Encoding not initialized.');
+    MemoryStreamIn := TStaticMemoryStream.Create(MemoryIn,SizeIn);
+    try
+      MemoryStreamOut := TWritableStaticMemoryStream.Create(MemoryOut,SizeOut);
+      try
+        EncodeStream(MemoryStreamIn,MemoryStreamOut);
+      finally
+        MemoryStreamOut.Free;
+      end;
+    finally
+      MemoryStreamIn.Free;
+    end;
   end
-else raise ESHInvalidState.Create('THuffmanEncoder.EncodeUpdate: Encoding already finalized.');
+else
+  begin
+    fBreakProcessing := False;
+    DoEncodeProgress(0.0);
+    If not fBreakProcessing then
+      begin
+        EncodeInit;
+        SizeInTemp := SizeIn;
+        SizeOutTemp := SizeOut;
+        EncodeUpdate(MemoryIn^,SizeInTemp,MemoryOut^,SizeOutTemp);
+      {
+        EncodeUpdate encodes everything it can, so if not all data were
+        consumed it can only mean the output buffer is too small for them.
+      }
+        If SizeInTemp >= SizeIn then
+          begin
+            SizeOutTemp := SizeOut - SizeOutTemp;
+            If not EncodeFinal(PtrAdvance(MemoryOut,SizeOutTemp)^,SizeOutTemp) then
+              raise ESHBufferTooSmall.CreateFmt('THuffmanEncoder.EncodeMemory: Output buffer too small (%u).',[SizeOut]);
+            DoEncodeProgress(1.0);
+          end
+        else raise ESHBufferTooSmall.CreateFmt('THuffmanEncoder.EncodeMemory: Output buffer too small (%u).',[SizeOut]);
+      end;
+  end;
 end;
 
+//------------------------------------------------------------------------------
 
+procedure THuffmanEncoder.EncodeBuffer(const BufferIn; SizeIn: TMemSize; out BufferOut; SizeOut: TMemSize);
+begin
+EncodeMemory(@BufferIn,SizeIn,@BufferOut,Sizeout);
+end;
 
+//------------------------------------------------------------------------------
+
+procedure THuffmanEncoder.EncodeAnsiString(const StrIn: AnsiString; var StrOut: AnsiString);
+begin
+EncodeMemory(PAnsiChar(StrIn),Length(StrIn) * SizeOf(AnsiChar),PAnsiChar(StrOut),Length(StrOut) * SizeOf(AnsiChar));
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanEncoder.EncodeWideString(const StrIn: WideString; var StrOut: WideString);
+begin
+EncodeMemory(PWideChar(StrIn),Length(StrIn) * SizeOf(WideChar),PWideChar(StrOut),Length(StrOut) * SizeOf(WideChar));
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanEncoder.EncodeString(const StrIn: String; var StrOut: String);
+begin
+EncodeMemory(PChar(StrIn),Length(StrIn) * SizeOf(Char),PChar(StrOut),Length(StrOut) * SizeOf(Char));
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanEncoder.EncodeStream(StreamIn: TStream; Count: Int64; StreamOut: TStream);
+var
+  InitCount:    Int64;
+  BufferIn:     Pointer;
+  BufferInTemp: Pointer;  
+  BufferOut:    Pointer;
+  BytesRead:    TMemSize;
+  BytesIn:      TMemSize;
+  BytesInTemp:  TMemSize;
+  BytesOut:     TMemSize;
+begin
+If Assigned(StreamIn) then
+  begin
+    If Assigned(StreamOut) then
+      begin
+        If Count = 0 then
+          Count := StreamIn.Size - StreamIn.Position;
+        If Count < 0 then
+          begin
+            StreamIn.Seek(0,soBeginning);
+            Count := StreamIn.Size;
+          end;
+        InitCount := Count;
+        fBreakProcessing := False;
+        DoEncodeProgress(0.0);
+        If not fBreakProcessing then
+          begin
+            GetMem(BufferOut,fStreamBufferSize);
+            try
+              EncodeInit;
+              If InitCount > 0 then
+                begin
+                  GetMem(BufferIn,fStreamBufferSize);
+                  try
+                    repeat
+                      BytesRead := TMemSize(StreamIn.Read(BufferIn^,Min(fStreamBufferSize,Count)));
+                      BufferInTemp := BufferIn;
+                      BytesInTemp := BytesRead;
+                      // process everything that was read
+                      repeat
+                        BytesIn := BytesInTemp;
+                        BytesOut := fStreamBufferSize;
+                        EncodeUpdate(BufferInTemp^,BytesIn,BufferOut^,BytesOut);
+                        If TMemSize(StreamOut.Write(BufferOut^,BytesOut)) >= BytesOut then
+                          begin
+                            PtrAdvanceVar(BufferInTemp,BytesIn);
+                            BytesInTemp := BytesInTemp - BytesIn;
+                          end
+                        else raise ESHBufferTooSmall.Create('THuffmanEncoder.EncodeStream: Output buffer too small.');
+                      until (BytesInTemp <= 0) and (BytesOut <= 0);
+                      Dec(Count,BytesRead); 
+                      DoEncodeProgress((InitCount - Count) / InitCount);
+                    until (BytesRead < fStreamBufferSize) or fBreakProcessing;
+                finally
+                  FreeMem(BufferIn,fStreamBufferSize);
+                end;
+              end;
+              // there should be at max. only few bytes buffered at this point
+              BytesOut := fStreamBufferSize;
+              If EncodeFinal(BufferOut^,BytesOut) then
+                begin
+                  If TMemSize(StreamOut.Write(BufferOut^,BytesOut)) < BytesOut then
+                    raise ESHBufferTooSmall.Create('THuffmanEncoder.EncodeStream: Output buffer too small.');
+                end
+              else ESHBufferTooSmall.Create('THuffmanEncoder.EncodeStream: Output buffer too small.');
+            finally
+              FreeMem(BufferOut,fStreamBufferSize);
+            end;
+            DoEncodeProgress(1.0);
+          end;
+      end
+    else raise ESHInvalidValue.Create('THuffmanEncoder.EncodeStream: Output stream not assigned.');
+  end
+else raise ESHInvalidValue.Create('THuffmanEncoder.EncodeStream: Input stream not assigned.');
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure THuffmanEncoder.EncodeStream(StreamIn: TStream; StreamOut: TStream);
+begin
+EncodeStream(StreamIn,-1,StreamOut);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanEncoder.EncodeFile(const FileNameIn,FileNameOut: String);
+var
+  FileStreamIn:   TFileStream;
+  FileStreamOut:  TFileStream;
+begin
+FileStreamIn := TFileStream.Create(StrToRTL(FileNameIn),fmOpenRead or fmShareDenyWrite);
+try
+  FileStreamIn.Seek(0,soBeginning);
+  FileStreamOut := TFileStream.Create(StrToRTL(FileNameOut),fmCreate or fmShareDenyWrite);
+  try
+    FileStreamOut.Seek(0,soBeginning);
+    EncodeStream(FileStreamIn,FileStreamOut);
+  finally
+    FileStreamOut.Free;
+  end;
+finally
+  FileStreamIn.Free;
+end;
+end;
 
 
 end.
