@@ -188,6 +188,7 @@ type
     procedure Initialize; virtual;
     procedure Finalize; virtual;
   public
+    class Function StreamBufferSizeDefault: TMemSize; virtual;
     constructor Create;
     destructor Destroy; override;
     Function BreakProcessing: Boolean; virtual;
@@ -229,12 +230,12 @@ type
     fEncodedSizeInitialized:      Boolean;
     fEncodedSizeFinalized:        Boolean;
     fEncodedSizeCounters:         array[UInt8] of Int64;
+    fEncodedSizeProgressCallback: TProgressCallback;
+    fEncodedSizeProgressEvent:    TProgressEvent;
     fEncodeInitialized:           Boolean;
     fEncodeFinalized:             Boolean;
     fEncodeBuffer:                Pointer;
     fEncodeBufferBitCount:        TMemSize;
-    fEncodedSizeProgressCallback: TProgressCallback;
-    fEncodedSizeProgressEvent:    TProgressEvent;
     fEncodeProgressCallback:      TProgressCallback;
     fEncodeProgressEvent:         TProgressEvent;
     procedure DoEncodedSizeProgress(Progress: Double); virtual;
@@ -332,6 +333,24 @@ type
                                  THuffmanDecoder
 --------------------------------------------------------------------------------
 ===============================================================================}
+type
+  // for internal use only
+  TSHDecodedSizeContext = record
+    TreeNodeIndex:  Integer;
+    Counter:        Int64;
+    Terminated:     Boolean;
+  end;
+
+  // for internal use only
+  TSHDecodeContext = record
+    TreeNodeIndex:      Integer;
+    TransferInBits:     NativeUInt;
+    TransferInBitCount: TMemSize;
+    TransferOutByte:    UInt8;
+    TransferOutByteSet: Boolean;
+    Terminated:         Boolean;
+  end;
+
 {===============================================================================
     THuffmanDecoder - class declaration
 ===============================================================================}
@@ -340,27 +359,22 @@ type
   protected
     fDecodedSizeInitialized:      Boolean;
     fDecodedSizeFinalized:        Boolean;
-    fDecodedSizeCurrTreeNodeIdx:  Integer;
-    fDecodedSizeCounter:          Int64;
-    fDecodedSizeTerminated:       Boolean;
-    fDecodeInitialized:           Boolean;
-    fDecodeFinalized:             Boolean;
-    fDecodeCurrTreeNodeIdx:       Integer;
-    fDecodeTransferBits:          NativeUInt;
-    fDecodeTransferBitCount:      TMemSize;
-    fDecodeTerminated:            Boolean;
+    fDecodedSizeContext:          TSHDecodedSizeContext;
     fDecodedSizeProgressCallback: TProgressCallback;
     fDecodedSizeProgressEvent:    TProgressEvent;
+    fDecodeInitialized:           Boolean;
+    fDecodeFinalized:             Boolean;
+    fDecodeContext:               TSHDecodeContext;
     fDecodeProgressCallback:      TProgressCallback;
     fDecodeProgressEvent:         TProgressEvent;
     procedure DoDecodedSizeProgress(Progress: Double); virtual;
     procedure DoDecodeProgress(Progress: Double); virtual;
     procedure Initialize; override;
+    procedure DecodeUpdateInternal(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize); virtual;
   public
     // decoded size
     procedure DecodedSizeInit; virtual;
-    procedure DecodedSizeUpdateFast(const Buffer; Size: TMemSize); virtual;
-    procedure DecodedSizeUpdate(const Buffer; Size: TMemSize); virtual;
+    Function DecodedSizeUpdate(const Buffer; Size: TMemSize): Boolean; virtual;
     Function DecodedSizeFinal: Int64; virtual;
     // decoded size macros
     Function DecodedSizeMemory(Memory: Pointer; Size: TMemSize): Int64; virtual;
@@ -386,7 +400,9 @@ type
     for details.
 
     Returns true when terminator seqence was not yet encountered, false when it
-    was.
+    was. If terminator sequence was encountered, you should stop decoding right
+    there. as no more data will be decoded even if you will provide more input
+    data.
   }
     Function DecodeUpdate(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize): Boolean; virtual;
   {
@@ -411,6 +427,7 @@ type
     property OnDecodeProgress: TProgressEvent read fDecodeProgressEvent write fDecodeProgressEvent;
   end;
 
+{$message 'debug, remove:'}  
 procedure PutBitsAndMoveDest(var Destination: PUInt8; DstBitOffset: TMemSize; Source: PUInt8; BitCount: TMemSize);
 Function LoadFrequencyBits(var Source: PUInt8; SrcBitOffset,BitCount: TMemSize): Int64;
 
@@ -420,16 +437,9 @@ uses
   Math,
   BitOps, StaticMemoryStream, StrRect;
 
-{$IFDEF FPC_DisableWarns}
-  {$DEFINE FPCDWM}
-  {$DEFINE W5024:={$WARN 5024 OFF}} // Parameter "$1" not used
-{$ENDIF}
-{$MESSAGE '^remove^'}
-
 {===============================================================================
     Implementation constants
 ===============================================================================}
-
 const
 {$IF SizeOf(NativeUInt) = 8}
   NativeUIntSizeShift = 3;
@@ -1289,7 +1299,7 @@ end;
 procedure THuffmanBase.Initialize;
 begin
 fHuffmanTree := THuffmanTree.Create;
-fStreamBufferSize := 64 * 1024; // 64KiB
+fStreamBufferSize := StreamBufferSizeDefault;
 fUncompressedSize := 0;
 fCompressedSize := 0;
 fCompressionRatio := 0.0;
@@ -1310,6 +1320,13 @@ end;
 {-------------------------------------------------------------------------------
     THuffmanBase - public methods
 -------------------------------------------------------------------------------}
+
+class Function THuffmanBase.StreamBufferSizeDefault: TMemSize;
+begin
+Result := 64 * 1024;  // 64KiB
+end;
+
+//------------------------------------------------------------------------------
 
 constructor THuffmanBase.Create;
 begin
@@ -1559,12 +1576,12 @@ inherited;
 fEncodedSizeInitialized := False;
 fEncodedSizeFinalized := False;
 FillChar(fEncodedSizeCounters,SizeOf(fEncodedSizeCounters),0);
+fEncodedSizeProgressCallback := nil;
+fEncodedSizeProgressEvent := nil;
 fEncodeInitialized := False;
 fEncodeFinalized := False;
 GetMem(fEncodeBuffer,SH_ENCODE_BUFFER_SIZE);
 fEncodeBufferBitCount := 0;
-fEncodedSizeProgressCallback := nil;
-fEncodedSizeProgressEvent := nil;
 fEncodeProgressCallback := nil;
 fEncodeProgressEvent := nil;
 end;
@@ -1894,7 +1911,7 @@ If fEncodeInitialized then
             // move whole bytes
             SizeOut := StoreWholeBytes;
             // store terminator
-             BitSequence := fHuffmanTree.TerminatorNode.BitSequence;
+            BitSequence := fHuffmanTree.TerminatorNode.BitSequence;
             If (fEncodeBufferBitCount + BitSequence.Length) <= SH_ENCODE_BUFFER_BITS then
               begin
                 EncodeBufferPtr := fEncodeBuffer;
@@ -1935,11 +1952,13 @@ end;
 
 procedure THuffmanEncoder.EncodeMemory(MemoryIn: Pointer; SizeIn: TMemSize; MemoryOut: Pointer; SizeOut: TMemSize);
 var
+  OrigSizeOut:      TMemSize;
   MemoryStreamIn:   TStaticMemoryStream;
   MemoryStreamOut:  TWritableStaticMemoryStream;
   TempSizeIn:       TMemSize;
   TempSizeOut:      TMemSize;
 begin
+OrigSizeOut := SizeOut; // only for potential exceptions
 If SizeIn > fStreamBufferSize then
   begin
     MemoryStreamIn := TStaticMemoryStream.Create(MemoryIn,SizeIn);
@@ -1974,10 +1993,10 @@ else
           begin
             SizeOut := SizeOut - TempSizeOut;
             If not EncodeFinal(PtrAdvance(MemoryOut,TempSizeOut)^,SizeOut) then
-              raise ESHBufferTooSmall.CreateFmt('THuffmanEncoder.EncodeMemory: Output buffer too small (%u).',[SizeOut]);
+              raise ESHBufferTooSmall.CreateFmt('THuffmanEncoder.EncodeMemory: Output buffer too small (%u).',[OrigSizeOut]);
             DoEncodeProgress(1.0);
           end
-        else raise ESHBufferTooSmall.CreateFmt('THuffmanEncoder.EncodeMemory: Output buffer too small (%u).',[SizeOut]);
+        else raise ESHBufferTooSmall.CreateFmt('THuffmanEncoder.EncodeMemory: Output buffer too small (%u).',[OrigSizeOut]);
       end;
   end;
 end;
@@ -2078,7 +2097,7 @@ If Assigned(StreamIn) then
                       If TMemSize(StreamOut.Write(BufferOut^,BytesOut)) < BytesOut then
                         raise ESHBufferTooSmall.Create('THuffmanEncoder.EncodeStream: Output stream too small.');
                     end
-                  else ESHBufferTooSmall.Create('THuffmanEncoder.EncodeStream: Output buffer too small.');
+                  else raise ESHBufferTooSmall.Create('THuffmanEncoder.EncodeStream: Output buffer too small.');
                 end;
             finally
               FreeMem(BufferOut,fStreamBufferSize);
@@ -2158,19 +2177,163 @@ begin
 inherited;
 fDecodedSizeInitialized := False;
 fDecodedSizeFinalized := False;
-fDecodedSizeCurrTreeNodeIdx := -1;
-FDecodedSizeCounter := 0;
-fDecodedSizeTerminated := False;
-fDecodeInitialized := False;
-fDecodeFinalized := False;
-fDecodeCurrTreeNodeIdx := -1;
-fDecodeTransferBits := 0;
-fDecodeTransferBitCount := 0;
-fDecodeTerminated := False;
+fDecodedSizeContext.TreeNodeIndex := -1;
+fDecodedSizeContext.Counter := 0;
+fDecodedSizeContext.Terminated := False;
 fDecodedSizeProgressCallback := nil;
 fDecodedSizeProgressEvent := nil;
+fDecodeInitialized := False;
+fDecodeFinalized := False;
+fDecodeContext.TreeNodeIndex := -1;
+fDecodeContext.TransferInBits := 0;
+fDecodeContext.TransferInBitCount := 0;
+fDecodeContext.TransferOutByte := 0;
+fDecodeContext.TransferOutByteSet := False;
+fDecodeContext.Terminated := False;
 fDecodeProgressCallback := nil;
 fDecodeProgressEvent := nil;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanDecoder.DecodeUpdateInternal(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize);
+var
+  BuffInPtr:    PUInt8;
+  BuffOutPtr:   PUInt8;
+  BytesIn:      TMemSize; // number of consumed input bytes
+  BytesOut:     TMemSize; // number of produced output bytes
+  LocalContext: TSHDecodeContext;  
+  CanContinue:  Boolean;
+{$IFNDEF UseSecureTreeTraversal}
+  TempNode:     PSHHuffmanTreeNode;
+{$ENDIF}
+
+  Function TransferBufferedOutByte: Boolean;
+  begin
+    Result := True;
+    If LocalContext.TransferOutByteSet then
+      begin
+        If SizeOut > 0 then
+          begin
+            BuffOutPtr^ := LocalContext.TransferOutByte;
+            LocalContext.TransferOutByteSet := False;
+            Dec(SizeOut);
+            Inc(BytesOut);
+            Inc(BuffOutPtr);
+            Inc(fUncompressedSize);
+          end
+        else Result := False;
+      end;
+  end;
+
+  Function DecodeAndTransferBits: Integer;
+  begin
+    Result := 0;
+    while (LocalContext.TransferInBitCount > 0) and CanContinue do
+      begin
+     {$IFDEF UseSecureTreeTraversal}
+
+        If not fHuffmanTree.TraverseTree((LocalContext.TransferInBits and 1) <> 0,LocalContext.TreeNodeIndex) then
+          with fHuffmanTree.TreeNodes[LocalContext.TreeNodeIndex] do
+            begin
+              If NodeKind <> nkTerminator then
+                begin
+                  LocalContext.TreeNodeIndex := -1;
+      {$ELSE}
+        TempNode := TempNode^.SubNodes[(LocalContext.TransferInBits and 1) <> 0];
+          If TempNode^.NodeKind <> nkBranch then  // I know this should not be indented...
+            begin
+              If TempNode^.NodeKind <> nkTerminator then
+                begin
+      {$ENDIF}
+                  If SizeOut > 0 then
+                    begin
+                    {$IFDEF UseSecureTreeTraversal}
+                      BuffOutPtr^ := ByteIndex;
+                    {$ELSE}
+                      BuffOutPtr^ := TempNode^.ByteIndex;
+                    {$ENDIF}
+                      Dec(SizeOut);
+                      Inc(BytesOut);
+                      Inc(BuffOutPtr);
+                      Inc(fUncompressedSize);
+                    end
+                  else
+                    begin
+                    {$IFDEF UseSecureTreeTraversal}
+                      LocalContext.TransferOutByte := ByteIndex;
+                    {$ELSE}
+                      LocalContext.TransferOutByte := TempNode^.ByteIndex;
+                    {$ENDIF}
+                      LocalContext.TransferOutByteSet := True;
+                      CanContinue := False;
+                    end;
+                {$IFNDEF UseSecureTreeTraversal}
+                  TempNode := fHuffmanTree.RootTreeNode;
+                {$ENDIF}
+                end
+              else
+                begin
+                  LocalContext.Terminated := True;
+                  CanContinue := False;
+                end;
+            end;
+        LocalContext.TransferInBits := LocalContext.TransferInBits shr 1;
+        Dec(LocalContext.TransferInBitCount);
+        Inc(Result);
+      end;
+  end;
+
+begin
+BuffInPtr := @BufferIn;
+BuffOutPtr := @BufferOut;
+BytesIn := 0;
+BytesOut := 0;
+// get global data into local copies
+LocalContext := fDecodeContext;
+{$IFNDEF UseSecureTreeTraversal}
+If LocalContext.TreeNodeIndex < 0 then
+  TempNode := fHuffmanTree.RootTreeNode
+else
+  TempNode := fHuffmanTree.TreeNodePtrs[LocalContext.TreeNodeIndex];
+{$ENDIF}
+try
+  If TransferBufferedOutByte then
+    begin
+      CanContinue := True;
+      // consume transfered bits
+      If (LocalContext.TransferInBitCount > 0) then
+        Inc(fCompressedSize,DecodeAndTransferBits);
+      // consume input data, first words...
+      while (SizeIn > SizeOf(NativeUInt)) and CanContinue and not LocalContext.Terminated do
+        begin
+          LocalContext.TransferInBits := PNativeUInt(BuffInPtr)^;
+          LocalContext.TransferInBitCount := SizeOf(NativeUInt) * 8;
+          Dec(SizeIn,SizeOf(NativeUInt));
+          Inc(BytesIn,SizeOf(NativeUInt));
+          Inc(BuffInPtr,SizeOf(NativeUInt));
+          Inc(fCompressedSize,DecodeAndTransferBits);
+        end;
+      // ...and then remaining odd bytes
+      while (SizeIn > 0) and CanContinue and not LocalContext.Terminated do
+        begin
+          LocalContext.TransferInBits := BuffInPtr^;
+          LocalContext.TransferInBitCount := 8;
+          Dec(SizeIn);
+          Inc(BytesIn);
+          Inc(BuffInPtr);
+          Inc(fCompressedSize,DecodeAndTransferBits);
+        end;
+    end;
+finally
+{$IFNDEF UseSecureTreeTraversal}
+  LocalContext.TreeNodeIndex := TempNode^.TreeIndex;
+{$ENDIF}
+  fDecodeContext := LocalContext;
+end;
+// return number of consumed and produced bytes
+SizeIn := BytesIn;
+SizeOut := BytesOut;
 end;
 
 {-------------------------------------------------------------------------------
@@ -2183,171 +2346,100 @@ If fHuffmanTree.TreeIsReady then
   begin
     fDecodedSizeInitialized := True;
     fDecodedSizeFinalized := False;
-    fDecodedSizeCurrTreeNodeIdx := -1;
-    fDecodedSizeCounter := 0;
-    fDecodedSizeTerminated := False;
+    fDecodedSizeContext.TreeNodeIndex := -1;
+    fDecodedSizeContext.Counter := 0;
+    fDecodedSizeContext.Terminated := False;
   end
 else raise ESHInvalidState.Create('THuffmanDecoder.DecodedSizeInit: Tree not ready.');
 end;
 
 //------------------------------------------------------------------------------
 
-procedure THuffmanDecoder.DecodedSizeUpdateFast(const Buffer; Size: TMemSize);
-{$IFDEF UseSecureTreeTraversal}
+Function THuffmanDecoder.DecodedSizeUpdate(const Buffer; Size: TMemSize): Boolean;
 var
-  LocalTreeIdx: Integer;
+  LocalContext: TSHDecodedSizeContext;
+{$IFNDEF UseSecureTreeTraversal}
+  TempNode:     PSHHuffmanTreeNode;
+{$ENDIF}
 
   procedure DecodeBits(IntBits: NativeUInt; HighBit: Integer);
   var
     i:  Integer;
   begin
-    For i := 0 to HighBit do
-      If not fHuffmanTree.TraverseTree(((IntBits shr i) and 1) <> 0,LocalTreeIdx) then
-        begin
-          If fHuffmanTree.TreeNodes[LocalTreeIdx].NodeKind <> nkTerminator then
-            begin
-              // normal byte node
-              Inc(fDecodedSizeCounter);
-              LocalTreeIdx := -1;
-            end
-          else
-            begin
-              // terminator node
-              fDecodedSizeTerminated := True;
-              Break{For i};
-          end;
-        end;
-  end;
-{$ELSE}
-var
-  TempNode: PSHHuffmanTreeNode;
-
-  procedure DecodeBits(IntBits: NativeUInt; HighBit: Integer);
-  var
-    i:  Integer;
-  begin
-    // fHuffmanTree.TraverseTree is too slow...
     For i := 0 to HighBit do
       begin
+      {$IFDEF UseSecureTreeTraversal}
+        If not fHuffmanTree.TraverseTree(((IntBits shr i) and 1) <> 0,LocalContext.TreeNodeIndex) then
+          begin
+            If fHuffmanTree.TreeNodes[LocalContext.TreeNodeIndex].NodeKind <> nkTerminator then
+      {$ELSE}
+        // because THuffmanTree.TraverseTree is slow...
         TempNode := TempNode^.SubNodes[((IntBits shr i) and 1) <> 0];
         If TempNode^.NodeKind <> nkBranch then
           begin
             If TempNode^.NodeKind <> nkTerminator then
+      {$ENDIF}
               begin
-                Inc(fDecodedSizeCounter);
+                // normal byte node
+                Inc(LocalContext.Counter);
+              {$IFDEF UseSecureTreeTraversal}
+                LocalContext.TreeNodeIndex := -1;
+              {$ELSE}
                 TempNode := fHuffmanTree.RootTreeNode;
+              {$ENDIF}
               end
             else
               begin
-                fDecodedSizeTerminated := True;
+                // terminator node
+                LocalContext.Terminated := True;
                 Break{For i};
-            end;
+              end;
           end;
       end;
   end;
-{$ENDIF}
+
 var
-  IntBuffPtr:   PNativeUInt;
-  ByteBuffPtr:  PUInt8;
-  i:            TMemSize;
+  BuffPtr:  PUInt8;
+  i:        TMemSize;
 begin
 If fDecodedSizeInitialized then
   begin
     If not fDecodedSizeFinalized then
       begin
-      {$IFDEF UseSecureTreeTraversal}
-        LocalTreeIdx := fDecodedSizeCurrTreeNodeIdx;
-      {$ELSE}
-        If fDecodedSizeCurrTreeNodeIdx < 0 then
+        LocalContext := fDecodedSizeContext;
+      {$IFNDEF UseSecureTreeTraversal}
+        If LocalContext.TreeNodeIndex < 0 then
           TempNode := fHuffmanTree.RootTreeNode
         else
-          TempNode := fHuffmanTree.TreeNodePtrs[fDecodedSizeCurrTreeNodeIdx];
+          TempNode := fHuffmanTree.TreeNodePtrs[LocalContext.TreeNodeIndex];
       {$ENDIF}
         try
-          IntBuffPtr := @Buffer;
+          BuffPtr := @Buffer;
           For i := 1 to (Size shr NativeUIntSizeShift) do
-            If not fDecodedSizeTerminated then
+            If not LocalContext.Terminated then
               begin
-                DecodeBits(IntBuffPtr^,Pred(SizeOf(NativeUInt) * 8));
-                Inc(IntBuffPtr);
+                DecodeBits(PNativeUInt(BuffPtr)^,Pred(SizeOf(NativeUInt) * 8));
+                Inc(BuffPtr,SizeOf(NativeUInt));
               end
-            else Exit;
-          ByteBuffPtr := PUInt8(IntBuffPtr);
+            else Break{For i};
           For i := 1 to (Size and Pred(SizeOf(NativeUInt))) do
-            If not fDecodedSizeTerminated then
+            If not LocalContext.Terminated then
               begin
-                DecodeBits(ByteBuffPtr^,7);
-                Inc(ByteBuffPtr);
+                DecodeBits(BuffPtr^,7);
+                Inc(BuffPtr);
               end
             else Break{For i};
         finally
-        {$IFDEF UseSecureTreeTraversal}
-          fDecodedSizeCurrTreeNodeIdx := LocalTreeIdx;
-        {$ELSE}
-          fDecodedSizeCurrTreeNodeIdx := TempNode^.TreeIndex;
+        {$IFNDEF UseSecureTreeTraversal}
+          LocalContext.TreeNodeIndex := TempNode^.TreeIndex;
         {$ENDIF}
+          fDecodedSizeContext := LocalContext;
         end;
       end
     else raise ESHInvalidState.Create('THuffmanDecoder.DecodedSizeUpdate: Decoded size obtaining already finalized.');
   end
 else raise ESHInvalidState.Create('THuffmanDecoder.DecodedSizeUpdate: Decoded size obtaining not initialized.');
-end;
-
-procedure THuffmanDecoder.DecodedSizeUpdate(const Buffer; Size: TMemSize);
-
-  procedure DecodeBits(IntBits: NativeUInt; HighBit: Integer);
-  var
-    i:  Integer;
-  begin
-    For i := 0 to HighBit do
-      If not fHuffmanTree.TraverseTree(((IntBits shr i) and 1) <> 0,fDecodedSizeCurrTreeNodeIdx) then
-        begin
-          If fHuffmanTree.TreeNodes[fDecodedSizeCurrTreeNodeIdx].NodeKind <> nkTerminator then
-            begin
-              // normal byte node
-              Inc(fDecodedSizeCounter);
-              fDecodedSizeCurrTreeNodeIdx := -1;
-            end
-          else
-            begin
-              // terminator node
-              fDecodedSizeTerminated := True;
-              Break{For i};
-            end;
-        end;
-  end;  
-
-var
-  IntBuffPtr:   PNativeUInt;
-  ByteBuffPtr:  PUInt8;
-  i:            TMemSize;
-begin
-DecodedSizeUpdateFast(Buffer,Size);
-exit;
-If fDecodedSizeInitialized then
-  begin
-    If not fDecodedSizeFinalized then
-      begin
-        IntBuffPtr := @Buffer;
-        For i := 1 to (Size shr NativeUIntSizeShift) do
-          If not fDecodedSizeTerminated then
-            begin
-              DecodeBits(IntBuffPtr^,Pred(SizeOf(NativeUInt) * 8));
-              Inc(IntBuffPtr);
-            end
-          else Exit;
-        ByteBuffPtr := PUInt8(IntBuffPtr);
-        For i := 1 to (Size and Pred(SizeOf(NativeUInt))) do
-          If not fDecodedSizeTerminated then
-            begin
-              DecodeBits(ByteBuffPtr^,7);
-              Inc(ByteBuffPtr);
-            end
-          else Break{For i};
-      end
-    else raise ESHInvalidState.Create('THuffmanDecoder.DecodedSizeUpdate: Decoded size obtaining already finalized.');
-  end
-else raise ESHInvalidState.Create('THuffmanDecoder.DecodedSizeUpdate: Decoded size obtaining not initialized.');
+Result := not fDecodedSizeContext.Terminated;
 end;
 
 //------------------------------------------------------------------------------
@@ -2358,8 +2450,12 @@ If fDecodedSizeInitialized then
   begin
     If not fDecodedSizeFinalized then
       begin
-        Result := fDecodedSizeCounter;
-        fDecodedSizeFinalized := True;
+        If fDecodedSizeContext.Terminated then
+          begin
+            Result := fDecodedSizeContext.Counter;
+            fDecodedSizeFinalized := True;
+          end
+        else raise ESHInvalidState.Create('THuffmanDecoder.DecodedSizeFinal: Encoded data are not properly terminated.');
       end
     else raise ESHInvalidState.Create('THuffmanDecoder.DecodedSizeFinal: Decoded size obtaining already finalized.');
   end
@@ -2432,6 +2528,7 @@ var
   InitialCount: Int64;
   Buffer:       Pointer;
   BytesRead:    Integer;
+  CanContinue:  Boolean;
 begin
 If Assigned(Stream) then
   begin
@@ -2454,10 +2551,10 @@ If Assigned(Stream) then
             try
               repeat
                 BytesRead := Stream.Read(Buffer^,Min(fStreamBufferSize,Count));
-                DecodedSizeUpdate(Buffer^,TMemSize(BytesRead));
+                CanContinue := DecodedSizeUpdate(Buffer^,TMemSize(BytesRead));
                 Dec(Count,BytesRead);
                 DoDecodedSizeProgress((InitialCount - Count) / InitialCount);
-              until (TMemSize(BytesRead) < fStreamBufferSize) or fBreakProcessing or fDecodedSizeTerminated;
+              until (TMemSize(BytesRead) < fStreamBufferSize) or fBreakProcessing or not CanContinue;
             finally
               FreeMem(Buffer,fStreamBufferSize);
             end;
@@ -2500,10 +2597,12 @@ If fHuffmanTree.TreeIsReady then
     fCompressionRatio := 0.0;
     fDecodeInitialized := True;
     fDecodeFinalized := False;
-    fDecodeCurrTreeNodeIdx := -1;
-    fDecodeTransferBits := 0;
-    fDecodeTransferBitCount := 0;
-    fDecodeTerminated := False
+    fDecodeContext.TreeNodeIndex := -1;
+    fDecodeContext.TransferInBits := 0;
+    fDecodeContext.TransferInBitCount := 0;
+    fDecodeContext.TransferOutByte := 0;
+    fDecodeContext.TransferOutByteSet := False;    
+    fDecodeContext.Terminated := False;
   end
 else raise ESHInvalidState.Create('THuffmanDecoder.DecodeInit: Tree not ready.');
 end;
@@ -2511,140 +2610,18 @@ end;
 //------------------------------------------------------------------------------
 
 Function THuffmanDecoder.DecodeUpdate(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize): Boolean;
-var
-  IntBuffInPtr:   PNativeUInt;
-  ByteBuffInPtr:  PUInt8;
-  BuffOutPtr:     PUInt8;
-  BytesIn:        TMemSize; // number of consumed input bytes
-  BytesOut:       TMemSize; // number of produced output bytes
-  // local copies of "global" data
-  LocalBits:      NativeUInt;
-  LocalBitCnt:    TMemSize;
-{$IFDEF UseSecureTreeTraversal}
-  LocalTreeIdx:   Integer;
-
-  Function DecodeAndTransferBits: Integer;
-  begin
-    Result := 0;
-    while (LocalBitCnt > 0) and (SizeOut > 0) do
-      begin
-        If not fHuffmanTree.TraverseTree((LocalBits and 1) <> 0,LocalTreeIdx) then
-          with fHuffmanTree.TreeNodes[LocalTreeIdx] do
-            begin
-              If NodeKind <> nkTerminator then
-                begin
-                  BuffOutPtr^ := ByteIndex;
-                  LocalTreeIdx := -1;
-                  Inc(fUncompressedSize);
-                  Dec(SizeOut);
-                  Inc(BytesOut);
-                  Inc(BuffOutPtr);
-                end
-              else
-                begin
-                  fDecodeTerminated := True;
-                  Break{while...};
-                end;
-            end;
-        LocalBits := LocalBits shr 1;
-        Dec(LocalBitCnt);
-        Inc(Result);
-      end;
-  end;
-{$ELSE}
-  TempNode: PSHHuffmanTreeNode;
-
-  Function DecodeAndTransferBits: Integer;
-  begin
-    Result := 0;
-    while (LocalBitCnt > 0) and (SizeOut > 0) do
-      begin
-        TempNode := TempNode^.SubNodes[(LocalBits and 1) <> 0];
-        If TempNode^.NodeKind <> nkBranch then
-          begin
-            If TempNode^.NodeKind <> nkTerminator then
-              begin
-                BuffOutPtr^ := TempNode^.ByteIndex;
-                TempNode := fHuffmanTree.RootTreeNode;
-                Inc(fUncompressedSize);
-                Dec(SizeOut);
-                Inc(BytesOut);
-                Inc(BuffOutPtr);
-              end
-            else
-              begin
-                fDecodeTerminated := True;
-                Break{while...};
-            end;
-          end;
-        LocalBits := LocalBits shr 1;
-        Dec(LocalBitCnt);
-        Inc(Result);
-      end;  
-  end;
-{$ENDIF}
 begin
 If fDecodeInitialized then
   begin
     If not fDecodeFinalized then
       begin
-        If not fDecodeTerminated then
-          begin
-            IntBuffInPtr := @BufferIn;
-            BuffOutPtr := @BufferOut;
-            BytesIn := 0;
-            BytesOut := 0;
-            // get global data into local copies
-            LocalBits := fDecodeTransferBits;
-            LocalBitCnt := fDecodeTransferBitCount;
-          {$IFDEF UseSecureTreeTraversal}
-            LocalTreeIdx := fDecodeCurrTreeNodeIdx;
-          {$ELSE}
-            If fDecodeCurrTreeNodeIdx < 0 then
-              TempNode := fHuffmanTree.RootTreeNode
-            else
-              TempNode := fHuffmanTree.TreeNodePtrs[fDecodeCurrTreeNodeIdx];
-          {$ENDIF}
-            // consume buffered bits
-            If (LocalBitCnt > 0) and (SizeOut > 0) then
-              Inc(fCompressedSize,DecodeAndTransferBits);
-            // consume input data, first words...
-            while (SizeIn >= SizeOf(NativeUInt)) and (SizeOut > 0) and not fDecodeTerminated do
-              begin
-                LocalBits := IntBuffInPtr^;
-                LocalBitCnt := SizeOf(NativeUInt) * 8;
-                Inc(fCompressedSize,DecodeAndTransferBits);
-                Dec(SizeIn,SizeOf(NativeUInt));
-                Inc(BytesIn,SizeOf(NativeUInt));
-                Inc(IntBuffInPtr);
-              end;
-            // ...and then remaining individual bytes
-            ByteBuffInPtr := PUInt8(IntBuffInPtr);
-            while (SizeIn > 0) and (SizeOut > 0) and not fDecodeTerminated do
-              begin
-                LocalBits := ByteBuffInPtr^;
-                LocalBitCnt := 8;
-                Inc(fCompressedSize,DecodeAndTransferBits);
-                Dec(SizeIn);
-                Inc(BytesIn);
-                Inc(ByteBuffInPtr);
-              end;
-            // store local copies of global data
-          {$IFDEF UseSecureTreeTraversal}
-            fDecodeCurrTreeNodeIdx := LocalTreeIdx;
-          {$ELSE}
-            fDecodeCurrTreeNodeIdx := TempNode^.TreeIndex;
-          {$ENDIF}
-            fDecodeTransferBitCount := LocalBitCnt;
-            fDecodeTransferBits := LocalBits;            
-            SizeIn := BytesIn;
-            SizeOut := BytesOut;
-          end;
+        If not fDecodeContext.Terminated then
+          DecodeUpdateInternal(BufferIn,SizeIn,BufferOut,SizeOut);
       end
     else raise ESHInvalidState.Create('THuffmanDecoder.DecodeUpdate: Decoding already finalized.');
   end
 else raise ESHInvalidState.Create('THuffmanDecoder.DecodeUpdate: Decoding not initialized.');
-Result := not fDecodeTerminated;
+Result := not fDecodeContext.Terminated;
 end;
 
 //------------------------------------------------------------------------------
@@ -2655,13 +2632,17 @@ If fDecodeInitialized then
   begin
     If not fDecodeFinalized then
       begin
-        // note that compressed size is in bits here, convert it to bytes
-        fCompressedSize := (fCompressedSize + 7) shr 3;
-        If fUncompressedSize <> 0 then
-          fCompressionRatio := fCompressedSize / fUncompressedSize
-        else
-          fCompressionRatio := 0.0;
-        fDecodeFinalized := True;
+        If fDecodeContext.Terminated then
+          begin
+            // note that compressed size is in bits here, convert it to bytes
+            fCompressedSize := (fCompressedSize + 7) shr 3;
+            If fUncompressedSize <> 0 then
+              fCompressionRatio := fCompressedSize / fUncompressedSize
+            else
+              fCompressionRatio := 0.0;
+            fDecodeFinalized := True;
+          end
+        else raise ESHInvalidState.Create('THuffmanDecoder.DecodeFinal: Encoded data are not properly terminated.');
       end
     else raise ESHInvalidState.Create('THuffmanDecoder.DecodeFinal: Decoding already finalized.');
   end
@@ -2673,7 +2654,7 @@ end;
 procedure THuffmanDecoder.DecodeMemory(MemoryIn: Pointer; SizeIn: TMemSize; MemoryOut: Pointer; SizeOut: TMemSize);
 var
   MemoryStreamIn:   TStaticMemoryStream;
-  MemoryStreamOut:  TWritableStaticMemoryStream;
+  MemoryStreamOut:  TWritableStaticMemoryStream;  
 begin
 If SizeIn > fStreamBufferSize then
   begin
