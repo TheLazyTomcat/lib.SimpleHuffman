@@ -138,8 +138,9 @@ type
   {
     properties
 
-    Use tree node indices (eg. LowTreeNodeIndex) for TreeNodes, for all other
-    array properties use byte indices (LowByteNodeIndex, ...).
+    Use tree node indices (eg. LowTreeNodeIndex) for properties TreeNodePtrs
+    and TreeNodes, for all other array properties use byte indices
+    (LowByteNodeIndex, ...).
   }
     property ByteNodes[Index: Integer]: TSHHuffmanTreeNode read GetByteNode; default;
     property Frequencies[Index: Integer]: Int64 read GetFrequency write SetFrequency;
@@ -149,10 +150,10 @@ type
 
     When working with a data that can only contain a limited set of bytes, it
     might be desirable to not save full frequency list, only what is needed.
-    You can do so by selecting nodes that are not present and setting their
-    saved property to false.
+    You can do so by setting NodeSaved property of bytes that are not present
+    to false (they all are true by default).
 
-      WARNING - remember to do the same before loading the saved tree.
+      WARNING - remember to do the same before loading a saved tree.
   }
     property NodeSaved[Index: Integer]: Boolean read GetNodeSaved write SetNodeSaved;
     property TreeNodePtrs[Index: Integer]: PSHHuffmanTreeNode read GetTreeNodePtr;    
@@ -191,8 +192,29 @@ type
     class Function StreamBufferSizeDefault: TMemSize; virtual;
     constructor Create;
     destructor Destroy; override;
+  {
+    BreakProcessing
+
+    You can call this method from within progress event or callback to break
+    out from a long processing.
+
+    This affects scanning (Scan*), encoded size obtaining (EncodedSize*),
+    encoding (Encode*), decoded size obtaining (DecodedSize*) and decoding
+    (Decode*).
+  }
     Function BreakProcessing: Boolean; virtual;
-    // scanning
+  {
+    scanning
+
+    Before encoding or decoding, it is necessary to provide a complete huffman
+    tree. For decoding, this is often done by loading a tree saved in encoding.
+    For encoding, the tree usually is not available in pre-computed form, but
+    must be computed for the specific data being encoded. Scanning is here for
+    this purpose.
+    Pass all data that are to be encoded to the scanning, and the tree will be
+    constructed from them. Also, the scanning returns number of bytes the data
+    will occupy when encoded.
+  }
     procedure ScanInit; virtual;
     procedure ScanUpdate(const Buffer; Size: TMemSize); virtual;
     Function ScanFinal: Int64; virtual;
@@ -243,7 +265,22 @@ type
     procedure Initialize; override;
     procedure Finalize; override;
   public
-    // encoded size
+  {
+    encoded size
+
+    Use encoded size obtaining to get number of bytes the provided data will
+    occupy when encoded using current huffman tree (the tree must be prepared).
+
+    Data are usually scanned before encoding, and the scanning provides the
+    encoded size too, therefore it is normally not necessaty to use encoded
+    size obtaining. It is here for a case where pre-computed huffman tree is
+    used for encoding, so scanning is not called, and one still needs to obtain
+    the encoded size.
+
+    Note that obtaining the encoded size is very fast, as there is little
+    processing done. The performance depends pretty much only on how fast can
+    the data be served.
+  }
     procedure EncodedSizeInit; virtual;
     procedure EncodedSizeUpdate(const Buffer; Size: TMemSize); virtual;
     Function EncodedSizeFinal: Int64; virtual;
@@ -277,7 +314,7 @@ type
     Upon return, the SizeIn will contain number of bytes that were consumed
     from BufferIn within the call, which might be less than was passed. SizeOut
     will contain number of bytes that were written into BufferOut (also might
-    be less than specified, but it will never be more).
+    be less than specified).
   }
     procedure EncodeUpdate(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize); virtual;
   {
@@ -305,11 +342,8 @@ type
               string variable parameters must also be allocated (string length
               set).
               You can get the required size, in bytes, when scanning the data,
-              or, if using pre-computed huffman tree, use EncodedSize* methods
-              (tree must be prepared/loaded before calling any EncodedSize*
-              method) - note that using EncodedSize* is "fast", in the sense
-              there is almost no processing done, so the performance depends
-              only on how fast can the data be served.
+              or, if using pre-computed huffman tree, using method for encoded
+              size obtaining (EncodedSize*)
   }
     procedure EncodeMemory(MemoryIn: Pointer; SizeIn: TMemSize; MemoryOut: Pointer; SizeOut: TMemSize); virtual;
     procedure EncodeBuffer(const BufferIn; SizeIn: TMemSize; out BufferOut; SizeOut: TMemSize); virtual;
@@ -372,7 +406,19 @@ type
     procedure Initialize; override;
     procedure DecodeUpdateInternal(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize); virtual;
   public
-    // decoded size
+  {
+    decoded size
+
+    Scans the provided encoded data and calculates number of bytes necessary to
+    store the same data in decoded state (ie. decoded size).
+
+      WARNING - this process is more-or-less the same as full decoding, only
+                the decoded data are not saved anywhere, which means obtaining
+                decoded size can be quite time consuming.
+                It is therefore recommended, if the size is required prior to
+                decoding, to store unencoded size with the encoded data and
+                only load it.
+  }
     procedure DecodedSizeInit; virtual;
     Function DecodedSizeUpdate(const Buffer; Size: TMemSize): Boolean; virtual;
     Function DecodedSizeFinal: Int64; virtual;
@@ -394,19 +440,24 @@ type
   {
     Decodes as many bits from input buffer as possible. The decoding stops
     either when all input bytes are consumed, when the output buffer becomes
-    full or when terminator sequence is encountered.
+    full or when termination sequence is encountered.
 
     The parameters work the same as in THuffmanEncoder.EncodeUpdate, see there
     for details.
 
-    Returns true when terminator seqence was not yet encountered, false when it
-    was. If terminator sequence was encountered, you should stop decoding right
-    there. as no more data will be decoded even if you will provide more input
-    data.
+    Returns true when termination seqence was not yet encountered, false when
+    it was. If termination sequence was encountered, you should stop decoding
+    right there, as no more data will be decoded even if you will provide more
+    input data.
   }
     Function DecodeUpdate(const BufferIn; var SizeIn: TMemSize; out BufferOut; var SizeOut: TMemSize): Boolean; virtual;
   {
-    DecodeFinal only finalizes the decoding, no further processing is required.
+    DecodeFinal
+
+    Only finalizes the decoding, no further processing is required.
+
+    If the encoded data were not complete then this method raises an exception
+    of type ESHInvalidState.
   }
     procedure DecodeFinal; virtual;
     // decoding macros
@@ -426,10 +477,6 @@ type
     property OnDecodeProgressEvent: TProgressEvent read fDecodeProgressEvent write fDecodeProgressEvent;
     property OnDecodeProgress: TProgressEvent read fDecodeProgressEvent write fDecodeProgressEvent;
   end;
-
-{$message 'debug, remove:'}  
-procedure PutBitsAndMoveDest(var Destination: PUInt8; DstBitOffset: TMemSize; Source: PUInt8; BitCount: TMemSize);
-Function LoadFrequencyBits(var Source: PUInt8; SrcBitOffset,BitCount: TMemSize): Int64;
 
 implementation
 
@@ -1393,7 +1440,7 @@ If fScanInitialized then
     If not fScanFinalized then
       begin
         fHuffmanTree.ConstructTree;
-        // get compressed size in bits...
+        // get encoded size in bits...
         Result := 7;
         For i := fHuffmanTree.LowByteNodeIndex to fHuffmanTree.HighByteNodeIndex do
           Inc(Result,(fHuffmanTree[i].Frequency * fHuffmanTree[i].BitSequence.Length));
