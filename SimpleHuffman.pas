@@ -1,13 +1,80 @@
+{-------------------------------------------------------------------------------
+
+  This Source Code Form is subject to the terms of the Mozilla Public
+  License, v. 2.0. If a copy of the MPL was not distributed with this
+  file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+-------------------------------------------------------------------------------}
+{===============================================================================
+
+  SimpleHuffman
+
+    Provides classes for encoding and decoding of data using a Huffman tree,
+    as a method of loss-less data compression.
+
+    Note that this entire library was written "in the blind" - that is, with no
+    access to internet or any other relevant information source.
+    Current implementation is based pretty much only on a short video describing
+    how the Huffman tree works, that is all.
+    Therefore, the implementation is naive, used nomenclature is completely
+    arbitrary, there are no performance optimizations and it is probably bugged.
+    It was written only as a product of curiosity and should be seen as such.
+
+  Version 1.0 alpha (2023-05-__)
+
+  Last change 2023-05-__
+
+  ©2011-2023 František Milt
+
+  Contacts:
+    František Milt: frantisek.milt@gmail.com
+
+  Support:
+    If you find this code useful, please consider supporting its author(s) by
+    making a small donation using the following link(s):
+
+      https://www.paypal.me/FMilt
+
+  Changelog:
+    For detailed changelog and history please refer to this git repository:
+
+      github.com/TheLazyTomcat/Lib.SimpleHuffman
+
+  Dependencies:
+    AuxClasses         - github.com/TheLazyTomcat/Lib.AuxClasses
+    AuxTypes           - github.com/TheLazyTomcat/Lib.AuxTypes
+    BasicUIM           - github.com/TheLazyTomcat/Lib.BasicUIM
+    BitOps             - github.com/TheLazyTomcat/Lib.BitOps
+  * SimpleCPUID        - github.com/TheLazyTomcat/Lib.SimpleCPUID
+    StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
+    StrRect            - github.com/TheLazyTomcat/Lib.StrRect
+
+    SimpleCPUID might not be needed, see BitOps library for details.
+
+===============================================================================}
 unit SimpleHuffman;
 
 {$IFDEF FPC}
   {$MODE ObjFPC}
-  {$DEFINE FPC_DisableWarns}
-  {$MACRO ON}
 {$ENDIF}
 {$H+}
 
-{.$DEFINE UseSecureTreeTraversal}
+//------------------------------------------------------------------------------
+{
+  UseSecureTreeTraversal
+
+  When defined, decoding and decoded size obtaining uses more secure, but much
+  slower implementation.
+
+  Not defined by default.
+
+  To enable/define this symbol in a project without changing this library,
+  define project-wide symbol SimpleHuffman_UseSecureTreeTraversal_ON.
+}
+{$UNDEF UseSecureTreeTraversal}
+{$IFDEF SimpleHuffman_UseSecureTreeTraversal_ON}
+  {$DEFINE UseSecureTreeTraversal}
+{$ENDIF}
 
 interface
 
@@ -57,6 +124,7 @@ type
     ParentNode:   PSHHuffmanTreeNode;
     ParentPath:   Boolean;
     SubNodes:     array[Boolean] of PSHHuffmanTreeNode;
+    CompFreq:     Int64;
   end;
 
 {===============================================================================
@@ -109,7 +177,7 @@ type
     Function CheckTreeNodeIndex(Index: Integer): Boolean; virtual;
     // frequency methods
     Function IncreaseFrequency(ByteIndex: UInt8): Int64; virtual;    
-    //Function CompressFrequencies(Force: Boolean = False): Boolean; virtual;
+    Function CompressFrequencies(Force: Boolean = False): Boolean; virtual;
     // tree methods
     Function TreeIsReady: Boolean; virtual;
     procedure ConstructTree; virtual;
@@ -600,7 +668,7 @@ If BitCount < 64 then
           end
         else
           begin
-            Move(Source^,Result,(BitCount + 7) shr 3);
+            Move(Source^,Addr(Result)^,(BitCount + 7) shr 3);
             // mask bits that are not supposed to be in the result
           {$IFDEF ENDIAN_BIG}
             Result := Int64(SwapEndian(UInt64(Result))) and (Int64($FFFFFFFFFFFFFFFF) shr (64 - BitCount));
@@ -614,6 +682,7 @@ If BitCount < 64 then
   end
 else raise ESHInvalidValue.CreateFmt('LoadFrequencyBits: Invalid value of frequency bits (%d).',[BitCount]);
 end;
+
 
 {===============================================================================
 --------------------------------------------------------------------------------
@@ -979,6 +1048,84 @@ end;
 
 //------------------------------------------------------------------------------
 
+Function THuffmanTree.CompressFrequencies(Force: Boolean = False): Boolean;
+var
+  LastFreq: Int64;
+  i:        Integer;
+  Control:  THuffmanTree;
+
+  procedure SetCompFreqAndPropagate(Index: Integer; CompFreq: Int64);
+  var
+    TempNode: PSHHuffmanTreeNode;
+  begin
+    fTreeNodes[Index]^.CompFreq := CompFreq;
+    TempNode := fTreeNodes[Index];
+    while Assigned(TempNode^.ParentNode) do
+      begin
+        TempNode := TempNode^.ParentNode;
+        Inc(TempNode^.CompFreq,CompFreq);
+        CompFreq := TempNode^.CompFreq;
+      end;
+  end;
+
+begin
+{$message 'todo - check if tree was constructed'}
+with TStringList.Create do
+try
+Result := False;
+  For i := LowTreeNodeIndex to HighTreeNodeIndex do
+    Add(Format('#%-3d  %d  %-8d  %-20s  %d',[i,Ord(fTreeNodes[i]^.NodeKind),fTreeNodes[i]^.Frequency,
+     Copy(DataToBitStr(fTreeNodes[i]^.BitSequence.Data,SizeOf(TSHBitSequenceData)),1,fTreeNodes[i]^.BitSequence.Length),fTreeNodes[i]^.CompFreq]));
+  SaveToFile('.\tree.txt');
+finally
+  Free;
+end;
+
+(*
+{$message 'todo - check if tree was constructed'}
+For i := LowTreeNodeIndex to HighTreeNodeIndex do
+  fTreeNodes[i]^.CompFreq := 0;
+SetCompFreqAndPropagate(fTerminatorNode.TreeIndex,1);
+LastFreq := 0;
+For i := LowTreeNodeIndex to HighTreeNodeIndex do
+  If fTreeNodes[i]^.Frequency > 0 then
+    begin
+      If fTreeNodes[i]^.NodeKind in [nkByteSaved,nkByteUnsaved] then
+        begin
+          // byte node
+          Inc(LastFreq);
+          SetCompFreqAndPropagate(i,LastFreq);
+        end
+      else
+        begin
+          // branch or terminator node
+          If fTreeNodes[i]^.CompFreq > LastFreq then
+            LastFreq := fTreeNodes[i]^.CompFreq;
+        end;
+    end;
+
+For i := LowByteNodeIndex to HighByteNodeIndex do
+  If fByteNodes[i].Frequency <> 0 then
+    WriteLn(Format('[%d] %d -> %d',[i,fByteNodes[i].Frequency,fByteNodes[i].CompFreq]));
+WriteLn;
+For i := LowTreeNodeIndex to HighTreeNodeIndex do
+  If fTreeNodes[i]^.Frequency <> 0 then
+    WriteLn(Format('[%d-%d] %d -> %d',[i,Ord(fTreeNodes[i]^.NodeKind),fTreeNodes[i]^.Frequency,fTreeNodes[i]^.CompFreq]));
+
+Control := THuffmanTree.Create;
+try
+  For i := LowByteNodeIndex to HighByteNodeIndex do
+    Control.Frequencies[i] := fByteNodes[i].CompFreq;
+  Control.ConstructTree;
+  WriteLn('same tree: ',Self.SameTree(Control));
+finally
+  Control.Free;
+end;
+*)
+end;
+
+//------------------------------------------------------------------------------
+
 Function THuffmanTree.TreeIsReady: Boolean;
 begin
 Result := Assigned(fRootTreeNode);
@@ -1023,10 +1170,10 @@ begin
 If Assigned(fRootTreeNode) then
   ClearTreeNodes;
 {
-  Preallocate tree nodes (512 should be enough for all cases, meaning there
+  Preallocate tree nodes (513 should be enough for all cases, meaning there
   will be no need for reallocation).
 }
-SetCapacity(SH_HUFFTREE_LIST_TREENODES,512);
+SetCapacity(SH_HUFFTREE_LIST_TREENODES,513);
 // first add all the byte nodes (they are being ordered as added)
 For i := LowByteNodeIndex to HighByteNodeIndex do
   begin
