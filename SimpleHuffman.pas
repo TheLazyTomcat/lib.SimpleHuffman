@@ -123,9 +123,17 @@ type
     BitSequence:  TSHBitSequence;
     ParentNode:   PSHHuffmanTreeNode;
     ParentPath:   Boolean;
-    SubNodes:     array[Boolean] of PSHHuffmanTreeNode;
+    ChildNodes:   array[Boolean] of PSHHuffmanTreeNode;
+    SiblingNode:  PSHHuffmanTreeNode;
     CompFreq:     Int64;
   end;
+
+type
+  TSHTreeSavingScheme = (tssFullFreq,tssAvrgDiff);
+
+  TSHTreeSavingFlag = (tsfNone);  // none implemented atm.
+
+  TSHTreeSavingFlags = set of TSHTreeSavingFlag;
 
 {===============================================================================
     THuffmanTree - class declaration
@@ -154,9 +162,26 @@ type
     procedure SetCount(List,Value: Integer); override;
     // tree building
     Function AddTreeNode(Node: PSHHuffmanTreeNode): Integer; virtual;
-    // streaming
-    Function StreamingSize(out FreqBits: Integer): TMemSize; overload; virtual;
+  {
+    streaming
+
+      *_0 ... tssFullFreq
+      *_1 ... tssAvrgDiff
+  }
     Function CountSavedByteNodes: Integer; virtual;
+    Function EncodeHeader(Scheme: TSHTreeSavingScheme; Flags: TSHTreeSavingFlags): UInt8; virtual;
+    procedure DecodeHeader(Header: UInt8; out Scheme: TSHTreeSavingScheme; out Flags: TSHTreeSavingFlags); virtual;
+    Function PreloadAllocationSize(Stream: TStream): TMemSize; virtual;
+
+    Function StreamingSize_0(out FreqBits: Integer): TMemSize; virtual;
+    Function StreamingSize_1(out AvrgFreq: Int64; out AvrgBits,DiffBits: Integer): TMemSize; virtual;
+
+    procedure SaveToBuffer_0(out Buffer; Size: TMemSize); virtual;
+    procedure SaveToBuffer_1(out Buffer; Size: TMemSize); virtual;
+
+    procedure LoadFromBuffer_0(const Buffer; Size: TMemSize); virtual;
+    procedure LoadFromBuffer_1(const Buffer; Size: TMemSize); virtual;
+
     // initialization and finalization
     procedure ClearByteNodes; virtual;
     procedure ClearTreeNodes; virtual;
@@ -196,13 +221,20 @@ type
   }
     Function TraverseTree(BitPath: Boolean; var TreeNodeIndex: Integer): Boolean; virtual;
     // streaming (saving, loading)
-    Function StreamingSize: TMemSize; overload; virtual;
-    procedure SaveToBuffer(out Buffer; Size: TMemSize); virtual;
-    procedure SaveToStream(Stream: TStream); virtual;
-    procedure SaveToFile(const FileName: String); virtual;
-    procedure LoadFromBuffer(const Buffer; Size: TMemSize); virtual;
-    procedure LoadFromStream(Stream: TStream); virtual;
-    procedure LoadFromFile(const FileName: String); virtual;
+
+    Function StreamingSize(Scheme: TSHTreeSavingScheme = tssFullFreq): TMemSize; virtual;
+    Function BestStreamingSize(out Scheme: TSHTreeSavingScheme): TMemSize; virtual;
+
+    procedure SaveToBuffer(out Buffer; Size: TMemSize; Scheme: TSHTreeSavingScheme = tssFullFreq); virtual;
+    procedure SaveToStream(Stream: TStream; Scheme: TSHTreeSavingScheme = tssFullFreq); virtual;
+    procedure SaveToFile(const FileName: String; Scheme: TSHTreeSavingScheme = tssFullFreq); virtual;
+
+    procedure LoadFromBuffer(const Buffer; Size: TMemSize; out Scheme: TSHTreeSavingScheme); overload; virtual;
+    procedure LoadFromBuffer(const Buffer; Size: TMemSize); overload; virtual;
+    procedure LoadFromStream(Stream: TStream; out Scheme: TSHTreeSavingScheme); overload; virtual;
+    procedure LoadFromStream(Stream: TStream); overload; virtual;
+    procedure LoadFromFile(const FileName: String; out Scheme: TSHTreeSavingScheme); overload; virtual;
+    procedure LoadFromFile(const FileName: String); overload; virtual;
   {
     properties
 
@@ -410,8 +442,8 @@ type
               string variable parameters must also be allocated (string length
               set).
               You can get the required size, in bytes, when scanning the data,
-              or, if using pre-computed huffman tree, using method for encoded
-              size obtaining (EncodedSize*)
+              or, for pre-computed huffman tree, using method for encoded size
+              obtaining (EncodedSize*)
   }
     procedure EncodeMemory(MemoryIn: Pointer; SizeIn: TMemSize; MemoryOut: Pointer; SizeOut: TMemSize); virtual;
     procedure EncodeBuffer(const BufferIn; SizeIn: TMemSize; out BufferOut; SizeOut: TMemSize); virtual;
@@ -575,7 +607,7 @@ var
 begin
 {
   This function assumes that destination and source are at completely different
-  memory locations and DstBitOffset is in interval <0,7>.
+  memory locations (they do not overlap) and DstBitOffset is in interval <0,7>.
 }
 If (DstBitOffset <> 0) or ((BitCount and 7) <> 0) then
   begin
@@ -637,7 +669,7 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function LoadFrequencyBits(var Source: PUInt8; SrcBitOffset,BitCount: TMemSize): Int64;
+Function LoadIntegerBits(var Source: PUInt8; SrcBitOffset,BitCount: TMemSize): Int64;
 var
   DstBitOffset: TMemSize;
 begin
@@ -681,6 +713,46 @@ If BitCount < 64 then
     else Result := 0;
   end
 else raise ESHInvalidValue.CreateFmt('LoadFrequencyBits: Invalid value of frequency bits (%d).',[BitCount]);
+end;
+
+//------------------------------------------------------------------------------
+
+Function TreeSavingSchemeToNum(Scheme: TSHTreeSavingScheme): Integer;
+begin
+case Scheme of
+  tssFullFreq:  Result := 0;
+  tssAvrgDiff:  Result := 1;
+else
+  raise ESHInvalidValue.CreateFmt('TreeSavingSchemeToNum: Invalid tree saving scheme (%d).',[Ord(Scheme)]);
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function NumToTreeSavingScheme(Num: Integer): TSHTreeSavingScheme;
+begin
+case Num of
+  0:  Result := tssFullFreq;
+  1:  Result := tssAvrgDiff;
+else
+  raise ESHInvalidValue.CreateFmt('NumToTreeSavingScheme: Invalid tree saving scheme (%d).',[Num]);
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function TreeSavingFlagsToNum(Flags: TSHTreeSavingFlags): Integer;
+begin
+Result := 0;
+If tsfNone in Flags then; // do nothing, no flag implemented
+end;
+
+//------------------------------------------------------------------------------
+
+Function NumToTreeSavingFlags(Num: Integer): TSHTreeSavingFlags;
+begin
+Result := [];
+If Num and 1 <> 0 then; // do nothing, no flag implemented
 end;
 
 
@@ -859,43 +931,6 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanTree.StreamingSize(out FreqBits: Integer): TMemSize;
-var
-  SavedNodesCnt:  Integer;
-  FreqHigh:       Int64;
-  i:              Integer;
-begin
-FreqHigh := 0;
-SavedNodesCnt := 0;
-// get highest frequency
-For i := LowByteNodeIndex to HighByteNodeIndex do
-  If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
-    begin
-      Inc(SavedNodesCnt);
-      If fByteNodes[UInt8(i)].Frequency > FreqHigh then
-        FreqHigh := fByteNodes[UInt8(i)].Frequency;
-    end
-  else If fByteNodes[UInt8(i)].Frequency <> 0 then
-    raise ESHInvalidValue.CreateFmt('THuffmanTree.StreamingSize: Unsaved node (%d) with frequency.',[i]);
-// how many bits is needed to store this number (reversed bit scan)
-If FreqHigh <> 0 then
-  FreqBits := BSR(UInt64(FreqHigh)) + 1
-else
-  FreqBits := 0;
-{
-  Calculate resulting size in bytes...
-
-  First byte contains how many bits is used to store each frequency.
-
-  If bits is above zero, then the next bytes contains bit-packed frequencies
-  (at most 256 values, for each only the lovest bits is stored), when bits is
-  zero then nothing is stored after the first byte.
-}
-Result := 1 + (TMemSize((FreqBits * SavedNodesCnt) + 7) shr 3 {Ceil(x / 8)});
-end;
-
-//------------------------------------------------------------------------------
-
 Function THuffmanTree.CountSavedByteNodes: Integer;
 var
   i:  Integer;
@@ -908,14 +943,377 @@ end;
 
 //------------------------------------------------------------------------------
 
+Function THuffmanTree.EncodeHeader(Scheme: TSHTreeSavingScheme; Flags: TSHTreeSavingFlags): UInt8;
+begin
+// scheme number
+Result := TreeSavingSchemeToNum(Scheme) and $F;
+// flag bits
+Result := Result or ((TreeSavingFlagsToNum(Flags) and $F) shl 4);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanTree.DecodeHeader(Header: UInt8; out Scheme: TSHTreeSavingScheme; out Flags: TSHTreeSavingFlags);
+begin
+Scheme := NumToTreeSavingScheme(Header and $F);
+Flags := NumToTreeSavingFlags((Header shr 4) and $F);
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanTree.PreloadAllocationSize(Stream: TStream): TMemSize;
+var
+  OrigPos:  Int64;
+  Buffer:   array[0..15] of UInt8;
+  Scheme:   TSHTreeSavingScheme;
+  Flags:    TSHTreeSavingFlags;
+  AvrgBits: Integer;
+  DiffBits: Integer;
+begin
+Result := 0;
+OrigPos := Stream.Position;
+try
+  If (Stream.Size - Stream.Position) >= 1 then
+    begin
+      // load and decode header to get saving scheme
+      Stream.ReadBuffer(Buffer,1);
+      DecodeHeader(Buffer[Low(Buffer)],Scheme,Flags);
+      case Scheme of
+        tssFullFreq:
+          If (Stream.Size - Stream.Position) >= 1{6 bits} then
+            begin
+              Stream.ReadBuffer(Buffer,1);
+              Result := (((Buffer[Low(Buffer)] and $3F {FreqBits}) * CountSavedByteNodes) + 21) shr 3;
+            end
+          else raise ESHBufferTooSmall.Create('THuffmanTree.PrealoadAllocationSize: Stream too small to contain frequency bits.');
+        tssAvrgDiff:
+          If (Stream.Size - Stream.Position) >= 2{12 bits} then
+            begin
+              // load bit counts
+              Stream.ReadBuffer(Buffer,2);
+              AvrgBits := Buffer[Low(Buffer)] and $3F;
+              DiffBits := ((Buffer[Low(Buffer)] shr 6) and $3) or UInt8((Buffer[Succ(Low(Buffer))] and $F) shl 2);
+              // calculate the size from bit counts
+              If DiffBits <> 0 then
+                Result := TMemSize((AvrgBits + ((DiffBits + 1) * CountSavedByteNodes) + 27) shr 3)
+              else
+                Result := TMemSize((AvrgBits + 27) shr 3)
+            end
+          else raise ESHBufferTooSmall.Create('THuffmanTree.PrealoadAllocationSize: Stream too small to contain bit counts.');
+      else
+        raise ESHInvalidValue.CreateFmt('THuffmanTree.PrealoadAllocationSize: Invalid tree saving scheme (%d).',[Ord(Scheme)]);
+      end;
+    end
+  else raise ESHBufferTooSmall.Create('THuffmanTree.PrealoadAllocationSize: Stream too small to contain a valid header.')
+finally
+  Stream.Seek(OrigPos,soBeginning);
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanTree.StreamingSize_0(out FreqBits: Integer): TMemSize;
+var
+  SavedNodesCnt:  Integer;
+  FreqHigh:       Int64;
+  i:              Integer;
+begin
+FreqHigh := 0;
+SavedNodesCnt := 0;
+// get highest frequency and cound number of saved nodes
+For i := LowByteNodeIndex to HighByteNodeIndex do
+  If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
+    begin
+      Inc(SavedNodesCnt);
+      If fByteNodes[UInt8(i)].Frequency > FreqHigh then
+        FreqHigh := fByteNodes[UInt8(i)].Frequency;
+    end
+  else If fByteNodes[UInt8(i)].Frequency <> 0 then
+    raise ESHInvalidValue.CreateFmt('THuffmanTree.StreamingSize: Unsaved node (%d) with frequency.',[i]);
+// how many bits is needed to store this number (reversed bit scan)
+If FreqHigh <> 0 then
+  begin
+    FreqBits := BSR(UInt64(FreqHigh)) + 1;
+    // FreqBits of 64 (or more) would imply a negative value
+    If FreqBits > 63 then
+      raise ESHInvalidValue.CreateFmt('THuffmanTree.StreamingSize_0: Invalid frequency bits (%d).',[FreqBits]);
+  end
+else FreqBits := 0;
+{
+  Calculate resulting size in bytes...
+
+  First four bits contain saving scheme number, next four bits are flags,
+  following six bits contain how much bits are used to store each frequency
+  (frequency bits).
+
+  If frequency bits is above zero, then the next bits contain bit-packed
+  frequencies (at most 256 values, for each only frequency bits are stored),
+  when frequency bits is zero then nothing is stored after the first 10 bits.
+}
+Result := TMemSize((FreqBits * SavedNodesCnt) + 21 {8 header bits, 6 frequency bits}) shr 3 {Ceil(x / 8)};
+end;
+
+//------------------------------------------------------------------------------
+
+Function THuffmanTree.StreamingSize_1(out AvrgFreq: Int64; out AvrgBits,DiffBits: Integer): TMemSize;
+var
+  SavedNodesCnt:  Integer;
+  i:              Integer;
+  HighDiff:       Int64;
+begin
+// get average frequency and cound number of saved nodes
+AvrgFreq := 0;
+SavedNodesCnt := 0;
+For i := LowByteNodeIndex to HighByteNodeIndex do
+  If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
+    begin
+      AvrgFreq := AvrgFreq + fByteNodes[UInt8(i)].Frequency;
+      Inc(SavedNodesCnt);
+    end
+  else If fByteNodes[UInt8(i)].Frequency <> 0 then
+    raise ESHInvalidValue.CreateFmt('THuffmanTree.StreamingSize: Unsaved node (%d) with frequency.',[i]);
+AvrgFreq := Trunc(AvrgFreq / SavedNodesCnt);
+// how many bits is needed to store average frequency
+If AvrgFreq <> 0 then
+  begin
+    AvrgBits := BSR(UInt64(AvrgFreq)) + 1;
+    // FreqBits of 64 (or more) would imply a negative value
+    If AvrgBits > 63 then
+      raise ESHInvalidValue.CreateFmt('THuffmanTree.StreamingSize_1: Invalid average frequency bits (%d).',[AvrgBits]);
+  end
+else AvrgBits := 0;
+// get highest difference from average (positive or negative)
+HighDiff := 0;
+For i := LowByteNodeIndex to HighByteNodeIndex do
+  If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
+    If Abs(fByteNodes[UInt8(i)].Frequency - AvrgFreq) > HighDiff then
+      HighDiff := Abs(fByteNodes[UInt8(i)].Frequency - AvrgFreq);
+{
+  How many bits is needed to store that difference.
+
+  This number has very specific "encoding"...
+  If it is zero, it is stored as zero and no difference is stored.
+  If it is any other value, then the real number of bits stored per difference
+  is DiffBits + 1. The one is here for a sign bit. This also means that no
+  difference can be stored with only one bit, because that would be only the
+  sign bit. And it also allows for store of full 64 bits of Int64.
+}
+If HighDiff <> 0 then
+  DiffBits := BSR(UInt64(HighDiff)) + 1
+else
+  DiffBits := 0;
+{
+  Get final size in bytes.
+
+  First four bits contain saving scheme number, next four bits are flags.
+  Following six bits contain how many bits are used to store average frequency,
+  and six bits after that contain how many bits are used to store each frequency
+  difference (this number is encoded, see higher).
+
+  After these, an average frequency is stored (only lower AvrgBits bits). Note
+  that the average frequency might not be present if AvrgBits is zero. If this
+  happens, then the average frequency is assumed to be equal to 0.
+
+  Then, if DiffBits is not zero, a bitpacked array of frequency differences is
+  stored (only lowest DiffBits + 1 bits are stored for each). Note that all
+  differences are signed.
+  If DiffBits is zero, then nothing is stored after the average frequency.
+}
+If DiffBits <> 0 then
+  Result := TMemSize((AvrgBits + ((DiffBits + 1) * SavedNodesCnt) + 27) shr 3)
+else
+  Result := TMemSize((AvrgBits + 27) shr 3)
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanTree.SaveToBuffer_0(out Buffer; Size: TMemSize);
+var
+  FreqBits:   Integer;
+  BuffPtr:    PUInt8;
+  BitOffset:  Integer;
+  i:          Integer;
+  Temp:       Int64;
+begin
+If Size >= StreamingSize_0(FreqBits) then
+  begin
+    BuffPtr := @Buffer;
+    // save header
+    BuffPtr^ := EncodeHeader(tssFullFreq,[]);
+    Inc(BuffPtr);
+    // save frequency bits (6 bits)
+    Temp := {$IFDEF ENDIAN_BIG}Int64(SwapEndian(UInt64{$ELSE}(({$ENDIF}(FreqBits)));
+    PutBitsAndMoveDest(BuffPtr,0,PUInt8(@Temp),6);
+    BitOffset := 6;
+    If FreqBits > 0 then
+      For i := LowByteNodeIndex to HighByteNodeIndex do
+        If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
+          begin
+            // make sure the number has little endianness
+          {$IFDEF ENDIAN_BIG}
+            Temp := Int64(SwapEndian(UInt64(fByteNodes[UInt8(i)].Frequency)));
+          {$ELSE}
+            Temp := fByteNodes[UInt8(i)].Frequency;
+          {$ENDIF}
+            PutBitsAndMoveDest(BuffPtr,BitOffset,PUInt8(@Temp),TMemSize(FreqBits));
+            BitOffset := (BitOffset + FreqBits) and 7;
+          end;
+  end
+else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.SaveToBuffer_0: Insufficient buffer size (%u).',[Size]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanTree.SaveToBuffer_1(out Buffer; Size: TMemSize);
+var
+  AvrgFreq:   Int64;
+  AvrgBits:   Integer;
+  DiffBits:   Integer;
+  BuffPtr:    PUInt8;
+  BitOffset:  Integer;
+  i:          Integer;
+  Temp:       Int64;
+begin
+If Size >= StreamingSize_1(AvrgFreq,AvrgBits,DiffBits) then
+  begin
+    BuffPtr := @Buffer;
+    // save header
+    BuffPtr^ := EncodeHeader(tssAvrgDiff,[]);
+    Inc(BuffPtr);
+    // save average frequency bits (6 bits)
+    Temp := {$IFDEF ENDIAN_BIG}Int64(SwapEndian(UInt64{$ELSE}(({$ENDIF}(AvrgBits)));
+    PutBitsAndMoveDest(BuffPtr,0,PUInt8(@Temp),6);
+    // save frequency difference bits (6 bits)
+    Temp := {$IFDEF ENDIAN_BIG}Int64(SwapEndian(UInt64{$ELSE}(({$ENDIF}(DiffBits)));
+    PutBitsAndMoveDest(BuffPtr,6,PUInt8(@Temp),6);  // BuffPtr is incremented here
+    // save average frequency
+    BitOffset := 4;
+    If AvrgBits > 0 then
+      begin
+        Temp := {$IFDEF ENDIAN_BIG}Int64(SwapEndian(UInt64{$ELSE}(({$ENDIF}(AvrgFreq)));
+        PutBitsAndMoveDest(BuffPtr,BitOffset,PUInt8(@Temp),TMemSize(AvrgBits));
+        BitOffset := (BitOffset + AvrgBits) and 7;
+      end;
+    // save frequency diferences
+    If DiffBits > 0 then
+      For i := LowByteNodeIndex to HighByteNodeIndex do
+        If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
+          begin
+          {$IFDEF ENDIAN_BIG}
+            Temp := Int64(SwapEndian(UInt64(fByteNodes[UInt8(i)].Frequency - AvrgFreq)));
+          {$ELSE}
+            Temp := fByteNodes[UInt8(i)].Frequency - AvrgFreq;
+          {$ENDIF}
+            PutBitsAndMoveDest(BuffPtr,BitOffset,PUInt8(@Temp),TMemSize(DiffBits + 1{sign bit}));
+            BitOffset := (BitOffset + DiffBits + 1) and 7;
+          end;
+  end
+else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.SaveToBuffer_1: Insufficient buffer size (%u).',[Size]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanTree.LoadFromBuffer_0(const Buffer; Size: TMemSize);
+var
+  BuffPtr:    PUInt8;
+  FreqBits:   Integer;
+  BitOffset:  Integer;
+  i:          Integer;
+begin
+If Size >= 2 then
+  begin
+    BuffPtr := @Buffer;
+    // skip header, we do not need it
+    Inc(BuffPtr);
+    // load frequency bits
+    FreqBits := LoadIntegerBits(BuffPtr,0,6);
+    If Size >= TMemSize(((FreqBits * CountSavedByteNodes) + 21) shr 3) then
+      begin
+        ClearTree;
+        BitOffset := 6;
+        If FreqBits > 0 then
+          For i := LowByteNodeIndex to HighByteNodeIndex do
+            If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
+              begin
+                fByteNodes[UInt8(i)].Frequency := LoadIntegerBits(BuffPtr,BitOffset,FreqBits);
+                BitOffset := (BitOffset + FreqBits) and 7;
+              end;
+        ConstructTree;
+      end
+    else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.LoadFromBuffer_0: Buffer too small to contain frequency table (%u).',[Size]);
+  end
+else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.LoadFromBuffer_0: Buffer too small to contain frequency bits (%u).',[Size]);
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanTree.LoadFromBuffer_1(const Buffer; Size: TMemSize);
+var
+  AvrgFreq:   Int64;
+  AvrgBits:   Integer;
+  DiffBits:   Integer;
+  BuffPtr:    PUInt8;
+  BitOffset:  Integer;
+  i:          Integer;
+  Temp:       Int64;
+begin
+If Size >= 3 then
+  begin
+    BuffPtr := @Buffer;
+    // skip header
+    Inc(BuffPtr);
+    // load average frequency bits
+    AvrgBits := LoadIntegerBits(BuffPtr,0,6);
+    // load frequency difference bits
+    DiffBits := LoadIntegerBits(BuffPtr,6,6);
+    If Size >= TMemSize((AvrgBits + (IfThen(DiffBits <> 0,DiffBits + 1,0) * CountSavedByteNodes) + 27) shr 3) then
+      begin
+        ClearTree;
+        BitOffset := 4;
+        // load average frequency
+        If AvrgBits > 0 then
+          begin
+            AvrgFreq := LoadIntegerBits(BuffPtr,BitOffset,AvrgBits);
+            BitOffset := (BitOffset + AvrgBits) and 7;
+          end
+        else AvrgFreq := 0;
+        // load differences
+        If DiffBits > 0 then
+          begin
+            For i := LowByteNodeIndex to HighByteNodeIndex do
+              If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
+                begin
+                  Temp := LoadIntegerBits(BuffPtr,BitOffset,DiffBits + 1);
+                  // expand sign bit and add to average
+                  fByteNodes[UInt8(i)].Frequency := Int64(SAR(UInt64(Temp shl (63 - DiffBits)),63 - DiffBits)) + AvrgFreq;
+                  BitOffset := (BitOffset + DiffBits + 1) and 7;
+                end;
+          end
+        else
+          begin
+            For i := LowByteNodeIndex to HighByteNodeIndex do
+              If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
+                fByteNodes[UInt8(i)].Frequency := AvrgFreq;
+          end;
+        ConstructTree;
+      end
+    else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.LoadFromBuffer_1: Buffer too small to contain all data (%u).',[Size]);
+  end
+else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.LoadFromBuffer_1: Buffer too small to contain bit counts (%u).',[Size]);
+end;
+
+//------------------------------------------------------------------------------
+
 procedure THuffmanTree.ClearByteNodes;
 var
-  i:  Integer;
+  i:        Integer;
+  NodeKind: TSHNodeKind;
 begin
-FillChar(fByteNodes,SizeOf(fByteNodes),0);
 For i := LowByteNodeIndex to HighByteNodeIndex do
   begin
-    fByteNodes[UInt8(i)].NodeKind := nkByteSaved;
+    NodeKind := fByteNodes[UInt8(i)].NodeKind;  // preserve node kind
+    FillChar(fByteNodes[UInt8(i)],SizeOf(TSHHuffmanTreeNode),0);
+    fByteNodes[UInt8(i)].NodeKind := NodeKind;
     fByteNodes[UInt8(i)].ByteIndex := UInt8(i);
     fByteNodes[UInt8(i)].TreeIndex := -1;
   end;
@@ -944,6 +1342,7 @@ end;
 
 procedure THuffmanTree.Initialize;
 begin
+FillChar(fByteNodes,SizeOf(fByteNodes),0);
 ClearTree;
 end;
 
@@ -1049,10 +1448,6 @@ end;
 //------------------------------------------------------------------------------
 
 Function THuffmanTree.CompressFrequencies(Force: Boolean = False): Boolean;
-var
-  LastFreq: Int64;
-  i:        Integer;
-  Control:  THuffmanTree;
 
   procedure SetCompFreqAndPropagate(Index: Integer; CompFreq: Int64);
   var
@@ -1063,12 +1458,57 @@ var
     while Assigned(TempNode^.ParentNode) do
       begin
         TempNode := TempNode^.ParentNode;
-        Inc(TempNode^.CompFreq,CompFreq);
+        If Assigned(TempNode^.SiblingNode) then
+          TempNode^.CompFreq := CompFreq + TempNode^.SiblingNode.CompFreq
+        else
+          TempNode^.CompFreq := CompFreq;
         CompFreq := TempNode^.CompFreq;
       end;
   end;
 
+var
+  LastFreq: Int64;
+  i,Cnt:    Integer;
+  Control:  THuffmanTree;
+
+  LastCompFreq:  Int64;
 begin
+{
+  1<   A
+  2<   B = A + 1
+  3
+  4
+  5    C = B + N = A + N + 1
+ >3    D = C + 1 = A + N + 2
+
+
+}
+(*
+LastCompFreq := 0;
+i := LowTreeNodeIndex;
+while i <= HighTreeNodeIndex do
+  begin
+    If fTreeNodes[i]^.NodeKind = nkBranch then
+      begin
+        If fTreeNodes[i]^.CompFreq < LastCompFreq then
+          begin
+            LastCompFreq := LastCompFreq + (LastCompFreq and 1) + 1;
+            SetCompFreqAndPropagate(fTreeNodes[i]^.ChildNodes[False]^.TreeIndex,LastCompFreq shr 1);
+            SetCompFreqAndPropagate(fTreeNodes[i]^.ChildNodes[True]^.TreeIndex,(LastCompFreq shr 1) + 1);
+            LastCompFreq := (LastCompFreq shr 1) + 1;
+            i := fTreeNodes[i]^.ChildNodes[True]^.TreeIndex;
+          end
+        else LastCompFreq := fTreeNodes[i]^.CompFreq;
+      end
+    else If fTreeNodes[i]^.Frequency > 0 then
+      begin
+        // leaf node with frequency above 0
+        Inc(LastCompFreq);
+        SetCompFreqAndPropagate(i,LastCompFreq);
+      end;
+    Inc(i);
+  end;
+*)
 {$message 'todo - check if tree was constructed'}
 with TStringList.Create do
 try
@@ -1111,7 +1551,8 @@ WriteLn;
 For i := LowTreeNodeIndex to HighTreeNodeIndex do
   If fTreeNodes[i]^.Frequency <> 0 then
     WriteLn(Format('[%d-%d] %d -> %d',[i,Ord(fTreeNodes[i]^.NodeKind),fTreeNodes[i]^.Frequency,fTreeNodes[i]^.CompFreq]));
-
+*)
+(*
 Control := THuffmanTree.Create;
 try
   For i := LowByteNodeIndex to HighByteNodeIndex do
@@ -1171,7 +1612,8 @@ If Assigned(fRootTreeNode) then
   ClearTreeNodes;
 {
   Preallocate tree nodes (513 should be enough for all cases, meaning there
-  will be no need for reallocation).
+  will be no need for reallocation) - there is always 256 byte nodes, 1
+  terminator node and 256 branch nodes (don't ask me why, it just is). 
 }
 SetCapacity(SH_HUFFTREE_LIST_TREENODES,513);
 // first add all the byte nodes (they are being ordered as added)
@@ -1191,15 +1633,18 @@ while i < HighTreeNodeIndex do
     New(TempNode);
     FillChar(TempNode^,SizeOf(TSHHuffmanTreeNode),0);
     TempNode^.NodeKind := nkBranch;
-    TempNode^.TreeIndex := -1;  // assigned later
+    // true TreeIndex is assined later, when the entire tree is constructed
+    TempNode^.TreeIndex := -1;
     TempNode^.Frequency := fTreeNodes[i]^.Frequency + fTreeNodes[Succ(i)]^.Frequency;
     // connect nodes
-    TempNode^.SubNodes[False] := fTreeNodes[i];
+    TempNode^.ChildNodes[False] := fTreeNodes[i];
     fTreeNodes[i]^.ParentNode := TempNode;
     fTreeNodes[i]^.ParentPath := False;
-    TempNode^.SubNodes[True] := fTreeNodes[Succ(i)];
+    fTreeNodes[i]^.SiblingNode := fTreeNodes[Succ(i)];
+    TempNode^.ChildNodes[True] := fTreeNodes[Succ(i)];
     fTreeNodes[Succ(i)]^.ParentNode := TempNode;
     fTreeNodes[Succ(i)]^.ParentPath := True;
+    fTreeNodes[Succ(i)]^.SiblingNode := fTreeNodes[i];
     AddTreeNode(TempNode);
     Inc(i,2);
   end;
@@ -1305,11 +1750,11 @@ begin
 If (TreeNodeIndex < Low(fTreeNodes)) or (TreeNodeIndex >= fTreeNodeCount) then
   begin
     If Assigned(fRootTreeNode) then
-      SubNode := fRootTreeNode^.SubNodes[BitPath]
+      SubNode := fRootTreeNode^.ChildNodes[BitPath]
     else
       raise ESHInvalidOperation.Create('THuffmanTree.TraverseTree: Root node not assigned.');
   end
-else SubNode := fTreeNodes[TreeNodeIndex]^.SubNodes[BitPath];
+else SubNode := fTreeNodes[TreeNodeIndex]^.ChildNodes[BitPath];
 If Assigned(SubNode) then
   TreeNodeIndex := SubNode^.TreeIndex
 else
@@ -1319,59 +1764,63 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanTree.StreamingSize: TMemSize;
+Function THuffmanTree.StreamingSize(Scheme: TSHTreeSavingScheme): TMemSize;
 var
-  FreqBits: Integer;
+  Dummy1,Dummy2:  Integer;
+  Dummy64:        Int64;
 begin
-Result := StreamingSize(FreqBits);
+case Scheme of
+  tssFullFreq:  Result := StreamingSize_0(Dummy1);
+  tssAvrgDiff:  Result := StreamingSize_1(Dummy64,Dummy1,Dummy2);
+else
+  raise ESHInvalidValue.CreateFmt('THuffmanTree.StreamingSize: Invalid tree saving scheme (%d).',[Ord(Scheme)]);
+end;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure THuffmanTree.SaveToBuffer(out Buffer; Size: TMemSize);
+Function THuffmanTree.BestStreamingSize(out Scheme: TSHTreeSavingScheme): TMemSize;
 var
-  BuffPtr:    PUInt8;
-  FreqBits:   Integer;
-  i:          Integer;
-  BitOffset:  Integer;
-  FreqTemp:   Int64;
+  i:    TSHTreeSavingScheme;
+  Temp: TMemSize;
 begin
-If Size >= StreamingSize(FreqBits) then
+Result := StreamingSize(Low(TSHTreeSavingScheme));
+Scheme := Low(TSHTreeSavingScheme);
+For i := Succ(Low(TSHTreeSavingScheme)) to High(TSHTreeSavingScheme) do
   begin
-    BuffPtr := @Buffer;
-    BuffPtr^ := UInt8(FreqBits);
-    If FreqBits > 0 then
+    Temp := StreamingSize(i);
+    If Temp < Result then
       begin
-        Inc(BuffPtr);
-        BitOffset := 0;
-        For i := LowByteNodeIndex to HighByteNodeIndex do
-          If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
-            begin
-              // make sure the number has little endianness
-            {$IFDEF ENDIAN_BIG}
-              FreqTemp := Int64(SwapEndian(UInt64(fByteNodes[UInt8(i)].Frequency)));
-            {$ELSE}
-              FreqTemp := fByteNodes[UInt8(i)].Frequency;
-            {$ENDIF}
-              PutBitsAndMoveDest(BuffPtr,BitOffset,PUInt8(@FreqTemp),TMemSize(FreqBits));
-              BitOffset := (BitOffset + FreqBits) and 7;
-            end;
+        Result := Temp;
+        Scheme := i;
+        Break{For i};
       end;
-  end
-else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.SaveToBuffer: Insufficient buffer size (%u).',[Size]);
+  end;
 end;
 
 //------------------------------------------------------------------------------
 
-procedure THuffmanTree.SaveToStream(Stream: TStream);
+procedure THuffmanTree.SaveToBuffer(out Buffer; Size: TMemSize; Scheme: TSHTreeSavingScheme = tssFullFreq);
+begin
+case Scheme of
+  tssFullFreq:  SaveToBuffer_0(Buffer,Size);
+  tssAvrgDiff:  SaveToBuffer_1(Buffer,Size);
+else
+  raise ESHInvalidValue.CreateFmt('THuffmanTree.SaveToBuffer: Invalid tree saving scheme (%d).',[Ord(Scheme)]);
+end;
+end;
+
+//------------------------------------------------------------------------------
+
+procedure THuffmanTree.SaveToStream(Stream: TStream; Scheme: TSHTreeSavingScheme = tssFullFreq);
 var
   Buffer:   Pointer;
   BuffSize: TMemSize;
 begin
-BuffSize := StreamingSize;
+BuffSize := StreamingSize(Scheme);
 GetMem(Buffer,BuffSize);
 try
-  SaveToBuffer(Buffer^,BuffSize);
+  SaveToBuffer(Buffer^,BuffSize,Scheme);
   Stream.WriteBuffer(Buffer^,BuffSize);
 finally
   FreeMem(Buffer,BuffSize);
@@ -1380,14 +1829,14 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure THuffmanTree.SaveToFile(const FileName: String);
+procedure THuffmanTree.SaveToFile(const FileName: String; Scheme: TSHTreeSavingScheme = tssFullFreq);
 var
   FileStream: TFileStream;
 begin
 FileStream := TFileStream.Create(StrToRTL(FileName),fmCreate or fmShareDenyWrite);
 try
   FileStream.Seek(0,soBeginning);
-  SaveToStream(FileStream);
+  SaveToStream(FileStream,Scheme);
 finally
   FileStream.Free;
 end;
@@ -1395,76 +1844,85 @@ end;
 
 //------------------------------------------------------------------------------
 
-procedure THuffmanTree.LoadFromBuffer(const Buffer; Size: TMemSize);
+procedure THuffmanTree.LoadFromBuffer(const Buffer; Size: TMemSize; out Scheme: TSHTreeSavingScheme);
 var
-  BuffPtr:    PUInt8;
-  FreqBits:   Integer;
-  i:          Integer;
-  BitOffset:  Integer;
+  Flags:  TSHTreeSavingFlags;
 begin
 If Size >= 1 then
   begin
-    BuffPtr := @Buffer;
-    FreqBits := BuffPtr^;
-    If Size >= TMemSize(1 + (((FreqBits * CountSavedByteNodes) + 7) shr 3)) then
-      begin
-        ClearTree;
-        If FreqBits > 0 then
-          begin
-            Inc(BuffPtr);
-            BitOffSet := 0;
-            For i := LowByteNodeIndex to HighByteNodeIndex do
-              If fByteNodes[UInt8(i)].NodeKind = nkByteSaved then
-                begin
-                  fByteNodes[UInt8(i)].Frequency := LoadFrequencyBits(BuffPtr,BitOffset,FreqBits);
-                  BitOffset := (BitOffset + FreqBits) and 7;
-                end;
-            end;
-        ConstructTree;
-      end
-    else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.LoadFromBuffer: Buffer too small to contain frequency table (%u).',[Size]);
+    // load and decode header to get saving scheme
+    DecodeHeader(UInt8(Buffer),Scheme,Flags);
+    case Scheme of
+      tssFullFreq:  LoadFromBuffer_0(Buffer,Size);
+      tssAvrgDiff:  LoadFromBuffer_1(Buffer,Size);
+    else
+      raise ESHInvalidValue.CreateFmt('THuffmanTree.LoadFromBuffer: Invalid tree saving scheme (%d).',[Ord(Scheme)]);
+    end;
   end
-else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.LoadFromBuffer: Buffer too small to contain frequency bits (%u).',[Size]);
+else raise ESHBufferTooSmall.CreateFmt('THuffmanTree.LoadFromBuffer: Buffer too small to contain a valid header (%u).',[Size]);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure THuffmanTree.LoadFromBuffer(const Buffer; Size: TMemSize);
+var
+  Scheme: TSHTreeSavingScheme;
+begin
+LoadFromBuffer(Buffer,Size,Scheme);
 end;
 
 //------------------------------------------------------------------------------
+
+procedure THuffmanTree.LoadFromStream(Stream: TStream; out Scheme: TSHTreeSavingScheme);
+var
+  BuffSize: TMemSize;
+  Buffer:   Pointer;
+begin
+BuffSize := PreloadAllocationSize(Stream);
+If BuffSize > 0 then
+  begin
+    GetMem(Buffer,BuffSize);
+    try
+      Stream.ReadBuffer(Buffer^,BuffSize);
+      LoadFromBuffer(Buffer^,BuffSize,Scheme);
+    finally
+      FreeMem(Buffer,BuffSize);
+    end;  
+  end
+else raise ESHInvalidValue.CreateFmt('THuffmanTree.LoadFromStream: Invalid allocation size (%u).',[BuffSize]);
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 procedure THuffmanTree.LoadFromStream(Stream: TStream);
 var
-  FreqBits: UInt8;
-  Buffer:   Pointer;
-  BuffSize: TMemSize;
+  Scheme: TSHTreeSavingScheme;
 begin
-FreqBits := 0;
-Stream.ReadBuffer(FreqBits,1);
-If FreqBits > 0 then
-  begin
-    BuffSize := 1 + TMemSize(((FreqBits * CountSavedByteNodes) + 7) shr 3);
-    GetMem(Buffer,BuffSize);
-    try
-      Stream.Seek(-1,soCurrent);
-      Stream.ReadBuffer(Buffer^,BuffSize);
-      LoadFromBuffer(Buffer^,BuffSize);
-    finally
-      FreeMem(Buffer,BuffSize);
-    end;
-  end
-else LoadFromBuffer(FreqBits,1);
+LoadFromStream(Stream,Scheme);
 end;
 
 //------------------------------------------------------------------------------
 
-procedure THuffmanTree.LoadFromFile(const FileName: String);
+procedure THuffmanTree.LoadFromFile(const FileName: String; out Scheme: TSHTreeSavingScheme);
 var
   FileStream: TFileStream;
 begin
 FileStream := TFileStream.Create(StrToRTL(FileName),fmOpenRead or fmShareDenyWrite);
 try
   FileStream.Seek(0,soBeginning);
-  LoadFromStream(FileStream);
+  LoadFromStream(FileStream,Scheme);
 finally
   FileStream.Free;
 end;
+end;
+
+// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+
+procedure THuffmanTree.LoadFromFile(const FileName: String);
+var
+  Scheme: TSHTreeSavingScheme;
+begin
+LoadFromFile(FileName,Scheme);
 end;
 
 
@@ -2434,7 +2892,7 @@ var
                 begin
                   LocalContext.TreeNodeIndex := -1;
       {$ELSE}
-        TempNode := TempNode^.SubNodes[(LocalContext.TransferInBits and 1) <> 0];
+        TempNode := TempNode^.ChildNodes[(LocalContext.TransferInBits and 1) <> 0];
           If TempNode^.NodeKind <> nkBranch then  // I know this should not be indented...
             begin
               If TempNode^.NodeKind <> nkTerminator then
@@ -2568,7 +3026,7 @@ var
             If fHuffmanTree.TreeNodes[LocalContext.TreeNodeIndex].NodeKind <> nkTerminator then
       {$ELSE}
         // because THuffmanTree.TraverseTree is slow...
-        TempNode := TempNode^.SubNodes[((IntBits shr i) and 1) <> 0];
+        TempNode := TempNode^.ChildNodes[((IntBits shr i) and 1) <> 0];
         If TempNode^.NodeKind <> nkBranch then
           begin
             If TempNode^.NodeKind <> nkTerminator then
