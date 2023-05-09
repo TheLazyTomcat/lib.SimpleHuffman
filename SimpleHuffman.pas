@@ -20,11 +20,11 @@
     arbitrary, there are no performance optimizations and it is probably bugged.
     It was written only as a product of curiosity and should be seen as such.
 
-  Version 1.0 alpha (2023-05-__)
+  Version 1.0 alpha (2023-05-09)
 
-  Last change 2023-05-__
+  Last change 2023-05-09
 
-  ©2011-2023 František Milt
+  ©2023 František Milt
 
   Contacts:
     František Milt: frantisek.milt@gmail.com
@@ -49,7 +49,7 @@
     StaticMemoryStream - github.com/TheLazyTomcat/Lib.StaticMemoryStream
     StrRect            - github.com/TheLazyTomcat/Lib.StrRect
 
-    SimpleCPUID might not be needed, see BitOps library for details.
+  SimpleCPUID might not be needed, see BitOps library for details.
 
 ===============================================================================}
 unit SimpleHuffman;
@@ -125,7 +125,6 @@ type
     ParentPath:   Boolean;
     ChildNodes:   array[Boolean] of PSHHuffmanTreeNode;
     SiblingNode:  PSHHuffmanTreeNode;
-    CompFreq:     Int64;
   end;
 
 type
@@ -145,7 +144,7 @@ type
     fTerminatorNode:  TSHHuffmanTreeNode;    
     fTreeNodes:       array of PSHHuffmanTreeNode;
     fTreeNodeCount:   Integer;
-    fRootTreeNode:    PSHHuffmanTreeNode;
+    fRootNode:        PSHHuffmanTreeNode;
     // getters, setters
     Function GetByteNode(Index: Integer): TSHHuffmanTreeNode; virtual;
     Function GetFrequency(Index: Integer): Int64; virtual;
@@ -172,16 +171,12 @@ type
     Function EncodeHeader(Scheme: TSHTreeSavingScheme; Flags: TSHTreeSavingFlags): UInt8; virtual;
     procedure DecodeHeader(Header: UInt8; out Scheme: TSHTreeSavingScheme; out Flags: TSHTreeSavingFlags); virtual;
     Function PreloadAllocationSize(Stream: TStream): TMemSize; virtual;
-
     Function StreamingSize_0(out FreqBits: Integer): TMemSize; virtual;
     Function StreamingSize_1(out AvrgFreq: Int64; out AvrgBits,DiffBits: Integer): TMemSize; virtual;
-
     procedure SaveToBuffer_0(out Buffer; Size: TMemSize); virtual;
     procedure SaveToBuffer_1(out Buffer; Size: TMemSize); virtual;
-
     procedure LoadFromBuffer_0(const Buffer; Size: TMemSize); virtual;
-    procedure LoadFromBuffer_1(const Buffer; Size: TMemSize); virtual;
-
+    procedure LoadFromBuffer_1(const Buffer; Size: TMemSize); virtual;  
     // initialization and finalization
     procedure ClearByteNodes; virtual;
     procedure ClearTreeNodes; virtual;
@@ -202,7 +197,6 @@ type
     Function CheckTreeNodeIndex(Index: Integer): Boolean; virtual;
     // frequency methods
     Function IncreaseFrequency(ByteIndex: UInt8): Int64; virtual;    
-    Function CompressFrequencies(Force: Boolean = False): Boolean; virtual;
     // tree methods
     Function TreeIsReady: Boolean; virtual;
     procedure ConstructTree; virtual;
@@ -259,7 +253,7 @@ type
     property TreeNodePtrs[Index: Integer]: PSHHuffmanTreeNode read GetTreeNodePtr;    
     property TreeNodes[Index: Integer]: TSHHuffmanTreeNode read GetTreeNode;
     property TerminatorNode: TSHHuffmanTreeNode read fTerminatorNode;
-    property RootTreeNode: PSHHuffmanTreeNode read fRootTreeNode;
+    property RootNode: PSHHuffmanTreeNode read fRootNode;
     property ByteNodeCount: Integer index SH_HUFFTREE_LIST_BYTENODES read GetCount;
     property TreeNodeCount: Integer index SH_HUFFTREE_LIST_TREENODES read GetCount;
   end;
@@ -976,7 +970,7 @@ try
   If (Stream.Size - Stream.Position) >= 1 then
     begin
       // load and decode header to get saving scheme
-      Stream.ReadBuffer(Buffer,1);
+      Stream.ReadBuffer(Addr(Buffer)^,1);
       DecodeHeader(Buffer[Low(Buffer)],Scheme,Flags);
       case Scheme of
         tssFullFreq:
@@ -1335,7 +1329,7 @@ For i := LowTreeNodeIndex to HighTreeNodeIndex do
     Dispose(fTreeNodes[i]);
 SetLength(fTreeNodes,0);
 fTreeNodeCount := 0;
-fRootTreeNode := nil;
+fRootNode := nil;
 end;
 
 //------------------------------------------------------------------------------
@@ -1447,129 +1441,9 @@ end;
 
 //------------------------------------------------------------------------------
 
-Function THuffmanTree.CompressFrequencies(Force: Boolean = False): Boolean;
-
-  procedure SetCompFreqAndPropagate(Index: Integer; CompFreq: Int64);
-  var
-    TempNode: PSHHuffmanTreeNode;
-  begin
-    fTreeNodes[Index]^.CompFreq := CompFreq;
-    TempNode := fTreeNodes[Index];
-    while Assigned(TempNode^.ParentNode) do
-      begin
-        TempNode := TempNode^.ParentNode;
-        If Assigned(TempNode^.SiblingNode) then
-          TempNode^.CompFreq := CompFreq + TempNode^.SiblingNode.CompFreq
-        else
-          TempNode^.CompFreq := CompFreq;
-        CompFreq := TempNode^.CompFreq;
-      end;
-  end;
-
-var
-  LastFreq: Int64;
-  i,Cnt:    Integer;
-  Control:  THuffmanTree;
-
-  LastCompFreq:  Int64;
-begin
-{
-  1<   A
-  2<   B = A + 1
-  3
-  4
-  5    C = B + N = A + N + 1
- >3    D = C + 1 = A + N + 2
-
-
-}
-(*
-LastCompFreq := 0;
-i := LowTreeNodeIndex;
-while i <= HighTreeNodeIndex do
-  begin
-    If fTreeNodes[i]^.NodeKind = nkBranch then
-      begin
-        If fTreeNodes[i]^.CompFreq < LastCompFreq then
-          begin
-            LastCompFreq := LastCompFreq + (LastCompFreq and 1) + 1;
-            SetCompFreqAndPropagate(fTreeNodes[i]^.ChildNodes[False]^.TreeIndex,LastCompFreq shr 1);
-            SetCompFreqAndPropagate(fTreeNodes[i]^.ChildNodes[True]^.TreeIndex,(LastCompFreq shr 1) + 1);
-            LastCompFreq := (LastCompFreq shr 1) + 1;
-            i := fTreeNodes[i]^.ChildNodes[True]^.TreeIndex;
-          end
-        else LastCompFreq := fTreeNodes[i]^.CompFreq;
-      end
-    else If fTreeNodes[i]^.Frequency > 0 then
-      begin
-        // leaf node with frequency above 0
-        Inc(LastCompFreq);
-        SetCompFreqAndPropagate(i,LastCompFreq);
-      end;
-    Inc(i);
-  end;
-*)
-{$message 'todo - check if tree was constructed'}
-with TStringList.Create do
-try
-Result := False;
-  For i := LowTreeNodeIndex to HighTreeNodeIndex do
-    Add(Format('#%-3d  %d  %-8d  %-20s  %d',[i,Ord(fTreeNodes[i]^.NodeKind),fTreeNodes[i]^.Frequency,
-     Copy(DataToBitStr(fTreeNodes[i]^.BitSequence.Data,SizeOf(TSHBitSequenceData)),1,fTreeNodes[i]^.BitSequence.Length),fTreeNodes[i]^.CompFreq]));
-  SaveToFile('.\tree.txt');
-finally
-  Free;
-end;
-
-(*
-{$message 'todo - check if tree was constructed'}
-For i := LowTreeNodeIndex to HighTreeNodeIndex do
-  fTreeNodes[i]^.CompFreq := 0;
-SetCompFreqAndPropagate(fTerminatorNode.TreeIndex,1);
-LastFreq := 0;
-For i := LowTreeNodeIndex to HighTreeNodeIndex do
-  If fTreeNodes[i]^.Frequency > 0 then
-    begin
-      If fTreeNodes[i]^.NodeKind in [nkByteSaved,nkByteUnsaved] then
-        begin
-          // byte node
-          Inc(LastFreq);
-          SetCompFreqAndPropagate(i,LastFreq);
-        end
-      else
-        begin
-          // branch or terminator node
-          If fTreeNodes[i]^.CompFreq > LastFreq then
-            LastFreq := fTreeNodes[i]^.CompFreq;
-        end;
-    end;
-
-For i := LowByteNodeIndex to HighByteNodeIndex do
-  If fByteNodes[i].Frequency <> 0 then
-    WriteLn(Format('[%d] %d -> %d',[i,fByteNodes[i].Frequency,fByteNodes[i].CompFreq]));
-WriteLn;
-For i := LowTreeNodeIndex to HighTreeNodeIndex do
-  If fTreeNodes[i]^.Frequency <> 0 then
-    WriteLn(Format('[%d-%d] %d -> %d',[i,Ord(fTreeNodes[i]^.NodeKind),fTreeNodes[i]^.Frequency,fTreeNodes[i]^.CompFreq]));
-*)
-(*
-Control := THuffmanTree.Create;
-try
-  For i := LowByteNodeIndex to HighByteNodeIndex do
-    Control.Frequencies[i] := fByteNodes[i].CompFreq;
-  Control.ConstructTree;
-  WriteLn('same tree: ',Self.SameTree(Control));
-finally
-  Control.Free;
-end;
-*)
-end;
-
-//------------------------------------------------------------------------------
-
 Function THuffmanTree.TreeIsReady: Boolean;
 begin
-Result := Assigned(fRootTreeNode);
+Result := Assigned(fRootNode);
 end;
 
 //------------------------------------------------------------------------------
@@ -1608,7 +1482,7 @@ var
   i:        Integer;
   TempNode: PSHHuffmanTreeNode;
 begin
-If Assigned(fRootTreeNode) then
+If Assigned(fRootNode) then
   ClearTreeNodes;
 {
   Preallocate tree nodes (513 should be enough for all cases, meaning there
@@ -1648,7 +1522,7 @@ while i < HighTreeNodeIndex do
     AddTreeNode(TempNode);
     Inc(i,2);
   end;
-fRootTreeNode := fTreeNodes[HighTreeNodeIndex];
+fRootNode := fTreeNodes[HighTreeNodeIndex];
 // assign correct tree indices
 For i := LowTreeNodeIndex to HighTreeNodeIndex do
   fTreeNodes[i]^.TreeIndex := i;
@@ -1749,8 +1623,8 @@ begin
 // following is much faster than calling CheckTreeNodeIndex
 If (TreeNodeIndex < Low(fTreeNodes)) or (TreeNodeIndex >= fTreeNodeCount) then
   begin
-    If Assigned(fRootTreeNode) then
-      SubNode := fRootTreeNode^.ChildNodes[BitPath]
+    If Assigned(fRootNode) then
+      SubNode := fRootNode^.ChildNodes[BitPath]
     else
       raise ESHInvalidOperation.Create('THuffmanTree.TraverseTree: Root node not assigned.');
   end
@@ -2921,7 +2795,7 @@ var
                       CanContinue := False;
                     end;
                 {$IFNDEF UseSecureTreeTraversal}
-                  TempNode := fHuffmanTree.RootTreeNode;
+                  TempNode := fHuffmanTree.RootNode;
                 {$ENDIF}
                 end
               else
@@ -2945,7 +2819,7 @@ BytesOut := 0;
 LocalContext := fDecodeContext;
 {$IFNDEF UseSecureTreeTraversal}
 If LocalContext.TreeNodeIndex < 0 then
-  TempNode := fHuffmanTree.RootTreeNode
+  TempNode := fHuffmanTree.RootNode
 else
   TempNode := fHuffmanTree.TreeNodePtrs[LocalContext.TreeNodeIndex];
 {$ENDIF}
@@ -3037,7 +2911,7 @@ var
               {$IFDEF UseSecureTreeTraversal}
                 LocalContext.TreeNodeIndex := -1;
               {$ELSE}
-                TempNode := fHuffmanTree.RootTreeNode;
+                TempNode := fHuffmanTree.RootNode;
               {$ENDIF}
               end
             else
@@ -3061,7 +2935,7 @@ If fDecodedSizeInitialized then
         LocalContext := fDecodedSizeContext;
       {$IFNDEF UseSecureTreeTraversal}
         If LocalContext.TreeNodeIndex < 0 then
-          TempNode := fHuffmanTree.RootTreeNode
+          TempNode := fHuffmanTree.RootNode
         else
           TempNode := fHuffmanTree.TreeNodePtrs[LocalContext.TreeNodeIndex];
       {$ENDIF}
